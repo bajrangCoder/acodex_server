@@ -2,9 +2,9 @@ extern crate pnet;
 mod term_server;
 
 use clap::Parser;
+use colored::Colorize;
 use pnet::datalink;
 use std::net::Ipv4Addr;
-use colored::Colorize;
 use term_server::*;
 
 const DEFAULT_PORT: u16 = 8767;
@@ -25,7 +25,12 @@ fn main() {
     let cli: Cli = Cli::parse();
     let ip = if cli.ip {
         get_ip_address().unwrap_or_else(|| {
-            println!("{} localhost.","Error: IP address not found. Starting server on".red().bold());
+            println!(
+                "{} localhost.",
+                "Error: IP address not found. Starting server on"
+                    .red()
+                    .bold()
+            );
             LOCAL_IP
         })
     } else {
