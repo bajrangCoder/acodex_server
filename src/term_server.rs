@@ -66,12 +66,10 @@ async fn create_terminal(
     State(sessions): State<Sessions>,
     Json(options): Json<TerminalOptions>,
 ) -> impl IntoResponse {
-    let window_size = Winsize {
-        ws_row: options.rows,
-        ws_col: options.cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
+
+    let pty_system = native_pty_system();
+
+    let shell = &std::env::var("SHELL").unwrap_or_else(|_| String::from("bash"));
 
     match openpty(&window_size, None) {
         Ok(pty) => {
@@ -93,7 +91,9 @@ async fn create_terminal(
                     };
 
                     sessions.lock().await.insert(pid, session);
+
                     println!("Spawned terminal with PID: {}", pid);
+
                     (axum::http::StatusCode::OK, pid.to_string()).into_response()
                 }
                 Err(e) => Json(ErrorResponse {
