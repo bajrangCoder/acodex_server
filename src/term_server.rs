@@ -5,21 +5,23 @@ use axum::{
     Json, Router,
 };
 use futures::{SinkExt, StreamExt};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use nix::pty::{openpty, Winsize};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    fs::File,
     io::{Read, Write},
     net::Ipv4Addr,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    process::{Child, Command, Stdio},
     sync::Arc,
 };
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
 struct TerminalSession {
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    reader: Arc<Mutex<Box<dyn Read + Send>>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    master_fd: Arc<Mutex<OwnedFd>>,
+    child: Child,
     buffer: String,
 }
 
@@ -69,37 +71,29 @@ async fn create_terminal(
     State(sessions): State<Sessions>,
     Json(options): Json<TerminalOptions>,
 ) -> impl IntoResponse {
-    let pty_system = native_pty_system();
-
-    let shell = if cfg!(windows) {
-        "powershell.exe"
-    } else {
-        &std::env::var("SHELL").unwrap_or_else(|_| String::from("bash"))
+    let window_size = Winsize {
+        ws_row: options.rows,
+        ws_col: options.cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
     };
 
-    let size = PtySize {
-        rows: options.rows,
-        cols: options.cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    };
+    match openpty(&window_size, None) {
+        Ok(pty) => {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| String::from("/bin/sh"));
 
-    match pty_system.openpty(size) {
-        Ok(pair) => {
-            let cmd = CommandBuilder::new(shell);
-            match pair.slave.spawn_command(cmd) {
+            let mut cmd = Command::new(&shell);
+            cmd.stdin(unsafe { Stdio::from_raw_fd(pty.slave.as_raw_fd()) });
+            cmd.stdout(unsafe { Stdio::from_raw_fd(pty.slave.as_raw_fd()) });
+            cmd.stderr(unsafe { Stdio::from_raw_fd(pty.slave.as_raw_fd()) });
+
+            match cmd.spawn() {
                 Ok(child) => {
-                    let pid = child.process_id().unwrap_or(0);
-                    drop(pair.slave); // Release slave after spawning
-
-                    let reader = Arc::new(Mutex::new(pair.master.try_clone_reader().unwrap()));
-                    let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
-                    let master = Arc::new(Mutex::new(pair.master as Box<dyn MasterPty + Send>));
+                    let pid = child.id();
 
                     let session = TerminalSession {
-                        master,
-                        reader,
-                        writer,
+                        master_fd: Arc::new(Mutex::new(pty.master)),
+                        child,
                         buffer: String::new(),
                     };
 
@@ -126,17 +120,18 @@ async fn resize_terminal(
 ) -> impl IntoResponse {
     let mut sessions = sessions.lock().await;
     if let Some(session) = sessions.get_mut(&pid) {
-        let size = PtySize {
-            rows: options.rows,
-            cols: options.cols,
-            pixel_width: 0,
-            pixel_height: 0,
+        let size = Winsize {
+            ws_row: options.rows,
+            ws_col: options.cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
         };
 
-        match session.master.lock().await.resize(size) {
-            Ok(_) => Json(serde_json::json!({"success": true})).into_response(),
-            Err(e) => Json(ErrorResponse {
-                error: format!("Failed to resize: {}", e),
+        let master_fd = session.master_fd.lock().await;
+        match unsafe { libc::ioctl(master_fd.as_raw_fd(), libc::TIOCSWINSZ, &size as *const _) } {
+            0 => Json(serde_json::json!({"success": true})).into_response(),
+            _ => Json(ErrorResponse {
+                error: "Failed to resize".to_string(),
             })
             .into_response(),
         }
@@ -157,25 +152,38 @@ async fn terminal_websocket(
 }
 
 async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions: Sessions) {
-    let (mut sender, mut receiver) = socket.split();
+    let (sender, mut receiver) = socket.split();
 
     let session_lock = sessions.lock().await;
     if let Some(session) = session_lock.get(&pid) {
-        let reader = session.reader.clone();
-        let writer = session.writer.clone();
+        let master_fd = session.master_fd.clone();
         drop(session_lock);
 
-        // Handle incoming data from PTY
+        // Set close-on-exec and nonblocking for master fd
+        let raw_fd = master_fd.lock().await.as_raw_fd();
+        if let Err(e) = set_close_on_exec(raw_fd, true) {
+            eprintln!("Failed to set close-on-exec: {}", e);
+        }
+        if let Err(e) = set_nonblocking(raw_fd) {
+            eprintln!("Failed to set nonblocking: {}", e);
+        }
+
         let ws_sender = Arc::new(Mutex::new(sender));
         let ws_sender_clone = ws_sender.clone();
+        let read_master_fd = master_fd.clone();
 
+        // Read from PTY
         tokio::spawn(async move {
             let mut buffer = [0u8; 1024];
             loop {
                 let n = {
-                    let mut reader = reader.lock().await;
-                    match reader.read(&mut buffer) {
-                        Ok(n) if n > 0 => n,
+                    let mut file =
+                        unsafe { File::from_raw_fd(read_master_fd.lock().await.as_raw_fd()) };
+                    match file.read(&mut buffer) {
+                        Ok(n) if n > 0 => {
+                            std::mem::forget(file); // Don't close the fd
+                            n
+                        }
                         _ => break,
                     }
                 };
@@ -193,22 +201,21 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions:
             }
         });
 
-        // Handle incoming WebSocket messages
+        // Write to PTY
         while let Some(Ok(message)) = receiver.next().await {
-            match message {
-                axum::extract::ws::Message::Text(text) => {
-                    let mut writer = writer.lock().await;
-                    if writer.write_all(text.as_bytes()).is_err() {
-                        break;
-                    }
-                }
-                axum::extract::ws::Message::Binary(data) => {
-                    let mut writer = writer.lock().await;
-                    if writer.write_all(&data).is_err() {
-                        break;
-                    }
-                }
-                _ => {}
+            let data = match message {
+                axum::extract::ws::Message::Text(ref text) => text.as_bytes().to_vec(),
+                axum::extract::ws::Message::Binary(ref data) => data.to_vec(),
+                _ => continue,
+            };
+
+            let mut file = unsafe { File::from_raw_fd(master_fd.lock().await.as_raw_fd()) };
+
+            let write_result = file.write_all(&data);
+            std::mem::forget(file); // Don't close the fd
+
+            if write_result.is_err() {
+                break;
             }
         }
     }
@@ -226,5 +233,72 @@ async fn terminate_terminal(
             error: "Session not found".to_string(),
         })
         .into_response()
+    }
+}
+
+use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+use std::os::unix::io::RawFd;
+
+fn set_close_on_exec(fd: RawFd, close_on_exec: bool) -> std::io::Result<()> {
+    let old_flags = match fcntl(fd, FcntlArg::F_GETFD) {
+        Ok(flags) => FdFlag::from_bits_truncate(flags),
+        Err(err) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("fcntl F_GETFD: {}", err),
+            ));
+        }
+    };
+
+    let mut new_flags = old_flags;
+    new_flags.set(FdFlag::FD_CLOEXEC, close_on_exec);
+
+    if old_flags == new_flags {
+        return Ok(());
+    }
+
+    match fcntl(fd, FcntlArg::F_SETFD(new_flags)) {
+        Ok(_) => Ok(()),
+        Err(err) => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("fcntl F_SETFD: {}", err),
+        )),
+    }
+}
+
+fn get_close_on_exec(fd: RawFd) -> std::io::Result<bool> {
+    match fcntl(fd, FcntlArg::F_GETFD) {
+        Ok(flags) => Ok(FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC)),
+        Err(err) => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("fcntl F_GETFD: {}", err),
+        )),
+    }
+}
+
+fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
+    let old_flags = match fcntl(fd, FcntlArg::F_GETFL) {
+        Ok(flags) => OFlag::from_bits_truncate(flags),
+        Err(err) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("fcntl F_GETFL: {}", err),
+            ));
+        }
+    };
+
+    let mut new_flags = old_flags;
+    new_flags.set(OFlag::O_NONBLOCK, true);
+
+    if old_flags != new_flags {
+        match fcntl(fd, FcntlArg::F_SETFL(new_flags)) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("fcntl F_SETFL: {}", err),
+            )),
+        }
+    } else {
+        Ok(())
     }
 }
