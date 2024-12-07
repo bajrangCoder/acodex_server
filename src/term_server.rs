@@ -33,11 +33,6 @@ struct TerminalOptions {
     rows: u16,
 }
 
-#[derive(Serialize)]
-struct TerminalResponse {
-    pid: u32,
-}
-
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
@@ -98,7 +93,8 @@ async fn create_terminal(
                     };
 
                     sessions.lock().await.insert(pid, session);
-                    Json(TerminalResponse { pid }).into_response()
+                    println!("Spawned terminal with PID: {}", pid);
+                    (axum::http::StatusCode::OK, pid.to_string()).into_response()
                 }
                 Err(e) => Json(ErrorResponse {
                     error: format!("Failed to spawn command: {}", e),
@@ -152,21 +148,14 @@ async fn terminal_websocket(
 }
 
 async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions: Sessions) {
+    println!("WebSocket connection established for PID: {}", pid);
     let (sender, mut receiver) = socket.split();
 
     let session_lock = sessions.lock().await;
     if let Some(session) = session_lock.get(&pid) {
         let master_fd = session.master_fd.clone();
         drop(session_lock);
-
-        // Set close-on-exec and nonblocking for master fd
-        let raw_fd = master_fd.lock().await.as_raw_fd();
-        if let Err(e) = set_close_on_exec(raw_fd, true) {
-            eprintln!("Failed to set close-on-exec: {}", e);
-        }
-        if let Err(e) = set_nonblocking(raw_fd) {
-            eprintln!("Failed to set nonblocking: {}", e);
-        }
+        println!("Found session for PID: {}", pid);
 
         let ws_sender = Arc::new(Mutex::new(sender));
         let ws_sender_clone = ws_sender.clone();
@@ -174,6 +163,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions:
 
         // Read from PTY
         tokio::spawn(async move {
+            println!("Starting PTY read loop for PID: {}", pid);
             let mut buffer = [0u8; 1024];
             loop {
                 let n = {
@@ -182,30 +172,50 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions:
                     match file.read(&mut buffer) {
                         Ok(n) if n > 0 => {
                             std::mem::forget(file); // Don't close the fd
+                            println!("Read {} bytes from PTY", n);
                             n
                         }
-                        _ => break,
+                        Ok(n) => {
+                            println!("Read returned {} bytes, breaking read loop", n);
+                            break;
+                        }
+                        Err(e) => {
+                            println!("Error reading from PTY: {}", e);
+                            break;
+                        }
                     }
                 };
 
                 if let Ok(text) = String::from_utf8(buffer[..n].to_vec()) {
-                    if let Err(_) = ws_sender_clone
+                    println!("Sending {} bytes to WebSocket", text.len());
+                    if let Err(e) = ws_sender_clone
                         .lock()
                         .await
                         .send(axum::extract::ws::Message::Text(text))
                         .await
                     {
+                        println!("Failed to send to WebSocket: {}", e);
                         break;
                     }
+                } else {
+                    println!("Failed to convert PTY output to UTF-8");
                 }
             }
+            println!("PTY read loop ended for PID: {}", pid);
         });
 
         // Write to PTY
+        println!("Starting WebSocket read loop for PID: {}", pid);
         while let Some(Ok(message)) = receiver.next().await {
             let data = match message {
-                axum::extract::ws::Message::Text(ref text) => text.as_bytes().to_vec(),
-                axum::extract::ws::Message::Binary(ref data) => data.to_vec(),
+                axum::extract::ws::Message::Text(ref text) => {
+                    println!("Received text message of {} bytes", text.len());
+                    text.as_bytes().to_vec()
+                }
+                axum::extract::ws::Message::Binary(ref data) => {
+                    println!("Received binary message of {} bytes", data.len());
+                    data.to_vec()
+                }
                 _ => continue,
             };
 
@@ -214,10 +224,14 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions:
             let write_result = file.write_all(&data);
             std::mem::forget(file); // Don't close the fd
 
-            if write_result.is_err() {
+            if let Err(e) = write_result {
+                println!("Failed to write to PTY: {}", e);
                 break;
             }
         }
+        println!("WebSocket connection closed for PID: {}", pid);
+    } else {
+        println!("No session found for PID: {}", pid);
     }
 }
 
@@ -233,72 +247,5 @@ async fn terminate_terminal(
             error: "Session not found".to_string(),
         })
         .into_response()
-    }
-}
-
-use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
-use std::os::unix::io::RawFd;
-
-fn set_close_on_exec(fd: RawFd, close_on_exec: bool) -> std::io::Result<()> {
-    let old_flags = match fcntl(fd, FcntlArg::F_GETFD) {
-        Ok(flags) => FdFlag::from_bits_truncate(flags),
-        Err(err) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("fcntl F_GETFD: {}", err),
-            ));
-        }
-    };
-
-    let mut new_flags = old_flags;
-    new_flags.set(FdFlag::FD_CLOEXEC, close_on_exec);
-
-    if old_flags == new_flags {
-        return Ok(());
-    }
-
-    match fcntl(fd, FcntlArg::F_SETFD(new_flags)) {
-        Ok(_) => Ok(()),
-        Err(err) => Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("fcntl F_SETFD: {}", err),
-        )),
-    }
-}
-
-fn get_close_on_exec(fd: RawFd) -> std::io::Result<bool> {
-    match fcntl(fd, FcntlArg::F_GETFD) {
-        Ok(flags) => Ok(FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC)),
-        Err(err) => Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("fcntl F_GETFD: {}", err),
-        )),
-    }
-}
-
-fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
-    let old_flags = match fcntl(fd, FcntlArg::F_GETFL) {
-        Ok(flags) => OFlag::from_bits_truncate(flags),
-        Err(err) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("fcntl F_GETFL: {}", err),
-            ));
-        }
-    };
-
-    let mut new_flags = old_flags;
-    new_flags.set(OFlag::O_NONBLOCK, true);
-
-    if old_flags != new_flags {
-        match fcntl(fd, FcntlArg::F_SETFL(new_flags)) {
-            Ok(_) => Ok(()),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("fcntl F_SETFL: {}", err),
-            )),
-        }
-    } else {
-        Ok(())
     }
 }
