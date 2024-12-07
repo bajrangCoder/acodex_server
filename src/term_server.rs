@@ -5,21 +5,23 @@ use axum::{
     Json, Router,
 };
 use futures::{SinkExt, StreamExt};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use nix::pty::{openpty, Winsize};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    fs::File,
     io::{Read, Write},
     net::Ipv4Addr,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    process::{Child, Command, Stdio},
     sync::Arc,
 };
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
 struct TerminalSession {
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    reader: Arc<Mutex<Box<dyn Read + Send>>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    master_fd: Arc<Mutex<OwnedFd>>,
+    child: Child,
     buffer: String,
 }
 
@@ -29,11 +31,6 @@ type Sessions = Arc<Mutex<HashMap<u32, TerminalSession>>>;
 struct TerminalOptions {
     cols: u16,
     rows: u16,
-}
-
-#[derive(Serialize)]
-struct TerminalResponse {
-    pid: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,42 +66,35 @@ async fn create_terminal(
     State(sessions): State<Sessions>,
     Json(options): Json<TerminalOptions>,
 ) -> impl IntoResponse {
-    let pty_system = native_pty_system();
-
-    let shell = if cfg!(windows) {
-        "powershell.exe"
-    } else {
-        &std::env::var("SHELL").unwrap_or_else(|_| String::from("bash"))
+    let window_size = Winsize {
+        ws_row: options.rows,
+        ws_col: options.cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
     };
 
-    let size = PtySize {
-        rows: options.rows,
-        cols: options.cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    };
+    match openpty(&window_size, None) {
+        Ok(pty) => {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| String::from("/bin/sh"));
 
-    match pty_system.openpty(size) {
-        Ok(pair) => {
-            let cmd = CommandBuilder::new(shell);
-            match pair.slave.spawn_command(cmd) {
+            let mut cmd = Command::new(&shell);
+            cmd.stdin(unsafe { Stdio::from_raw_fd(pty.slave.as_raw_fd()) });
+            cmd.stdout(unsafe { Stdio::from_raw_fd(pty.slave.as_raw_fd()) });
+            cmd.stderr(unsafe { Stdio::from_raw_fd(pty.slave.as_raw_fd()) });
+
+            match cmd.spawn() {
                 Ok(child) => {
-                    let pid = child.process_id().unwrap_or(0);
-                    drop(pair.slave); // Release slave after spawning
-
-                    let reader = Arc::new(Mutex::new(pair.master.try_clone_reader().unwrap()));
-                    let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
-                    let master = Arc::new(Mutex::new(pair.master as Box<dyn MasterPty + Send>));
+                    let pid = child.id();
 
                     let session = TerminalSession {
-                        master,
-                        reader,
-                        writer,
+                        master_fd: Arc::new(Mutex::new(pty.master)),
+                        child,
                         buffer: String::new(),
                     };
 
                     sessions.lock().await.insert(pid, session);
-                    Json(TerminalResponse { pid }).into_response()
+                    println!("Spawned terminal with PID: {}", pid);
+                    (axum::http::StatusCode::OK, pid.to_string()).into_response()
                 }
                 Err(e) => Json(ErrorResponse {
                     error: format!("Failed to spawn command: {}", e),
@@ -126,17 +116,18 @@ async fn resize_terminal(
 ) -> impl IntoResponse {
     let mut sessions = sessions.lock().await;
     if let Some(session) = sessions.get_mut(&pid) {
-        let size = PtySize {
-            rows: options.rows,
-            cols: options.cols,
-            pixel_width: 0,
-            pixel_height: 0,
+        let size = Winsize {
+            ws_row: options.rows,
+            ws_col: options.cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
         };
 
-        match session.master.lock().await.resize(size) {
-            Ok(_) => Json(serde_json::json!({"success": true})).into_response(),
-            Err(e) => Json(ErrorResponse {
-                error: format!("Failed to resize: {}", e),
+        let master_fd = session.master_fd.lock().await;
+        match unsafe { libc::ioctl(master_fd.as_raw_fd(), libc::TIOCSWINSZ, &size as *const _) } {
+            0 => Json(serde_json::json!({"success": true})).into_response(),
+            _ => Json(ErrorResponse {
+                error: "Failed to resize".to_string(),
             })
             .into_response(),
         }
@@ -157,60 +148,90 @@ async fn terminal_websocket(
 }
 
 async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions: Sessions) {
-    let (mut sender, mut receiver) = socket.split();
+    println!("WebSocket connection established for PID: {}", pid);
+    let (sender, mut receiver) = socket.split();
 
     let session_lock = sessions.lock().await;
     if let Some(session) = session_lock.get(&pid) {
-        let reader = session.reader.clone();
-        let writer = session.writer.clone();
+        let master_fd = session.master_fd.clone();
         drop(session_lock);
+        println!("Found session for PID: {}", pid);
 
-        // Handle incoming data from PTY
         let ws_sender = Arc::new(Mutex::new(sender));
         let ws_sender_clone = ws_sender.clone();
+        let read_master_fd = master_fd.clone();
 
+        // Read from PTY
         tokio::spawn(async move {
+            println!("Starting PTY read loop for PID: {}", pid);
             let mut buffer = [0u8; 1024];
             loop {
                 let n = {
-                    let mut reader = reader.lock().await;
-                    match reader.read(&mut buffer) {
-                        Ok(n) if n > 0 => n,
-                        _ => break,
+                    let mut file =
+                        unsafe { File::from_raw_fd(read_master_fd.lock().await.as_raw_fd()) };
+                    match file.read(&mut buffer) {
+                        Ok(n) if n > 0 => {
+                            std::mem::forget(file); // Don't close the fd
+                            println!("Read {} bytes from PTY", n);
+                            n
+                        }
+                        Ok(n) => {
+                            println!("Read returned {} bytes, breaking read loop", n);
+                            break;
+                        }
+                        Err(e) => {
+                            println!("Error reading from PTY: {}", e);
+                            break;
+                        }
                     }
                 };
 
                 if let Ok(text) = String::from_utf8(buffer[..n].to_vec()) {
-                    if let Err(_) = ws_sender_clone
+                    println!("Sending {} bytes to WebSocket", text.len());
+                    if let Err(e) = ws_sender_clone
                         .lock()
                         .await
                         .send(axum::extract::ws::Message::Text(text))
                         .await
                     {
+                        println!("Failed to send to WebSocket: {}", e);
                         break;
                     }
+                } else {
+                    println!("Failed to convert PTY output to UTF-8");
                 }
             }
+            println!("PTY read loop ended for PID: {}", pid);
         });
 
-        // Handle incoming WebSocket messages
+        // Write to PTY
+        println!("Starting WebSocket read loop for PID: {}", pid);
         while let Some(Ok(message)) = receiver.next().await {
-            match message {
-                axum::extract::ws::Message::Text(text) => {
-                    let mut writer = writer.lock().await;
-                    if writer.write_all(text.as_bytes()).is_err() {
-                        break;
-                    }
+            let data = match message {
+                axum::extract::ws::Message::Text(ref text) => {
+                    println!("Received text message of {} bytes", text.len());
+                    text.as_bytes().to_vec()
                 }
-                axum::extract::ws::Message::Binary(data) => {
-                    let mut writer = writer.lock().await;
-                    if writer.write_all(&data).is_err() {
-                        break;
-                    }
+                axum::extract::ws::Message::Binary(ref data) => {
+                    println!("Received binary message of {} bytes", data.len());
+                    data.to_vec()
                 }
-                _ => {}
+                _ => continue,
+            };
+
+            let mut file = unsafe { File::from_raw_fd(master_fd.lock().await.as_raw_fd()) };
+
+            let write_result = file.write_all(&data);
+            std::mem::forget(file); // Don't close the fd
+
+            if let Err(e) = write_result {
+                println!("Failed to write to PTY: {}", e);
+                break;
             }
         }
+        println!("WebSocket connection closed for PID: {}", pid);
+    } else {
+        println!("No session found for PID: {}", pid);
     }
 }
 
