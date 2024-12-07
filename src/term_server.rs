@@ -31,11 +31,6 @@ struct TerminalOptions {
     rows: u16,
 }
 
-#[derive(Serialize)]
-struct TerminalResponse {
-    pid: u32,
-}
-
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
@@ -71,11 +66,7 @@ async fn create_terminal(
 ) -> impl IntoResponse {
     let pty_system = native_pty_system();
 
-    let shell = if cfg!(windows) {
-        "powershell.exe"
-    } else {
-        &std::env::var("SHELL").unwrap_or_else(|_| String::from("bash"))
-    };
+    let shell = &std::env::var("SHELL").unwrap_or_else(|_| String::from("bash"));
 
     let size = PtySize {
         rows: options.rows,
@@ -104,7 +95,7 @@ async fn create_terminal(
                     };
 
                     sessions.lock().await.insert(pid, session);
-                    Json(TerminalResponse { pid }).into_response()
+                    (axum::http::StatusCode::OK, pid.to_string()).into_response()
                 }
                 Err(e) => Json(ErrorResponse {
                     error: format!("Failed to spawn command: {}", e),

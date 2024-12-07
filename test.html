@@ -1,0 +1,120 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="UTF-8" />
+        <title>Xterm.js Terminal</title>
+        <!-- Include xterm.css -->
+        <link
+            rel="stylesheet"
+            href="https://cdn.jsdelivr.net/npm/xterm/css/xterm.css"
+        />
+        <style>
+            /* Style to ensure the terminal takes up the full screen */
+            body,
+            html {
+                padding: 0;
+                margin: 0;
+                width: 100%;
+                height: 100%;
+            }
+            #terminal-container {
+                width: 100%;
+                height: 100%;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="terminal-container"></div>
+
+        <!-- Include xterm.js and xterm-addon-fit.js scripts -->
+        <script src="https://cdn.jsdelivr.net/npm/xterm/lib/xterm.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit/lib/xterm-addon-fit.js"></script>
+        <script>
+            document.addEventListener("DOMContentLoaded", function () {
+                // Create a new terminal instance
+                const term = new Terminal();
+                const fitAddon = new FitAddon.FitAddon();
+                term.loadAddon(fitAddon);
+
+                // Open the terminal in the #terminal-container div
+                term.open(document.getElementById("terminal-container"));
+
+                // Fit the terminal size to the container
+                fitAddon.fit();
+
+                // Get the number of columns and rows in the terminal
+                const cols = term.cols;
+                const rows = term.rows;
+
+                // Create a new terminal session on the server
+                fetch("http://localhost:8767/terminals", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify({ cols: cols, rows: rows }),
+                })
+                    .then((response) => response.text())
+                    .then((pid) => {
+                        pid = pid.trim(); // Clean up the PID
+
+                        // Connect to the terminal's WebSocket
+                        const socketURL =
+                            "ws://localhost:8767/terminals/" + pid + "/ws";
+                        const socket = new WebSocket(socketURL);
+
+                        // When data is received from the server, write it to the terminal
+                        socket.onmessage = function (event) {
+                            term.write(event.data);
+                        };
+
+                        // When data is typed in the terminal, send it to the server
+                        term.onData(function (data) {
+                            socket.send(data);
+                        });
+
+                        // Handle terminal resize events
+                        term.onResize(function (size) {
+                            if (!pid) {
+                                return;
+                            }
+                            const cols = size.cols;
+                            const rows = size.rows;
+                            fetch(
+                                "http://localhost:8767/terminals/" +
+                                    pid +
+                                    "/resize",
+                                {
+                                    method: "POST",
+                                    headers: {
+                                        "Content-Type": "application/json",
+                                    },
+                                    body: JSON.stringify({
+                                        cols: cols,
+                                        rows: rows,
+                                    }),
+                                },
+                            );
+                        });
+
+                        // Terminate the terminal session when the window is closed
+                        window.onbeforeunload = function () {
+                            if (pid) {
+                                fetch(
+                                    "http://localhost:8767/terminals/" +
+                                        pid +
+                                        "/terminate",
+                                    {
+                                        method: "POST",
+                                    },
+                                );
+                            }
+                        };
+                    })
+                    .catch((error) => {
+                        console.error("Error:", error);
+                    });
+            });
+        </script>
+    </body>
+</html>
