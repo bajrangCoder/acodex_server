@@ -16,6 +16,7 @@ use std::{
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
+#[allow(dead_code)]
 struct TerminalSession {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     reader: Arc<Mutex<Box<dyn Read + Send>>>,
@@ -64,6 +65,11 @@ async fn create_terminal(
     State(sessions): State<Sessions>,
     Json(options): Json<TerminalOptions>,
 ) -> impl IntoResponse {
+    println!(
+        "Creating new terminal with cols={}, rows={}",
+        options.cols, options.rows
+    );
+
     let pty_system = native_pty_system();
 
     let shell = &std::env::var("SHELL").unwrap_or_else(|_| String::from("bash"));
@@ -81,6 +87,7 @@ async fn create_terminal(
             match pair.slave.spawn_command(cmd) {
                 Ok(child) => {
                     let pid = child.process_id().unwrap_or(0);
+                    println!("Terminal created successfully with PID: {}", pid);
                     drop(pair.slave); // Release slave after spawning
 
                     let reader = Arc::new(Mutex::new(pair.master.try_clone_reader().unwrap()));
@@ -97,16 +104,22 @@ async fn create_terminal(
                     sessions.lock().await.insert(pid, session);
                     (axum::http::StatusCode::OK, pid.to_string()).into_response()
                 }
-                Err(e) => Json(ErrorResponse {
-                    error: format!("Failed to spawn command: {}", e),
-                })
-                .into_response(),
+                Err(e) => {
+                    println!("Failed to spawn command: {}", e);
+                    Json(ErrorResponse {
+                        error: format!("Failed to spawn command: {}", e),
+                    })
+                    .into_response()
+                }
             }
         }
-        Err(e) => Json(ErrorResponse {
-            error: format!("Failed to open PTY: {}", e),
-        })
-        .into_response(),
+        Err(e) => {
+            println!("Failed to open PTY: {}", e);
+            Json(ErrorResponse {
+                error: format!("Failed to open PTY: {}", e),
+            })
+            .into_response()
+        }
     }
 }
 
@@ -115,6 +128,10 @@ async fn resize_terminal(
     Path(pid): Path<u32>,
     Json(options): Json<TerminalOptions>,
 ) -> impl IntoResponse {
+    println!(
+        "Resizing terminal {} to cols={}, rows={}",
+        pid, options.cols, options.rows
+    );
     let mut sessions = sessions.lock().await;
     if let Some(session) = sessions.get_mut(&pid) {
         let size = PtySize {
@@ -144,14 +161,16 @@ async fn terminal_websocket(
     Path(pid): Path<u32>,
     State(sessions): State<Sessions>,
 ) -> impl IntoResponse {
+    println!("WebSocket connection request for terminal {}", pid);
     ws.on_upgrade(move |socket| handle_socket(socket, pid, sessions))
 }
 
 async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions: Sessions) {
-    let (mut sender, mut receiver) = socket.split();
+    let (sender, mut receiver) = socket.split();
 
     let session_lock = sessions.lock().await;
     if let Some(session) = session_lock.get(&pid) {
+        println!("WebSocket connection established for terminal {}", pid);
         let reader = session.reader.clone();
         let writer = session.writer.clone();
         drop(session_lock);
@@ -178,6 +197,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions:
                         .send(axum::extract::ws::Message::Text(text))
                         .await
                     {
+                        println!("Failed to send WebSocket message for terminal {}", pid);
                         break;
                     }
                 }
@@ -190,12 +210,14 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions:
                 axum::extract::ws::Message::Text(text) => {
                     let mut writer = writer.lock().await;
                     if writer.write_all(text.as_bytes()).is_err() {
+                        println!("Failed to write to terminal {}", pid);
                         break;
                     }
                 }
                 axum::extract::ws::Message::Binary(data) => {
                     let mut writer = writer.lock().await;
                     if writer.write_all(&data).is_err() {
+                        println!("Failed to write binary data to terminal {}", pid);
                         break;
                     }
                 }
@@ -209,10 +231,13 @@ async fn terminate_terminal(
     State(sessions): State<Sessions>,
     Path(pid): Path<u32>,
 ) -> impl IntoResponse {
+    println!("Terminating terminal {}", pid);
     let mut sessions = sessions.lock().await;
     if sessions.remove(&pid).is_some() {
+        println!("Terminal {} terminated successfully", pid);
         Json(serde_json::json!({"success": true})).into_response()
     } else {
+        println!("Failed to terminate terminal {}: session not found", pid);
         Json(ErrorResponse {
             error: "Session not found".to_string(),
         })
