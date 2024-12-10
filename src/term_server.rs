@@ -15,6 +15,8 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::{DefaultMakeSpan, TraceLayer};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[allow(dead_code)]
 struct TerminalSession {
@@ -39,6 +41,14 @@ struct ErrorResponse {
 
 #[tokio::main]
 pub async fn start_server(host: Ipv4Addr, port: u16) {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                format!("{}=debug,tower_http=debug", env!("CARGO_CRATE_NAME")).into()
+            }),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
 
     let cors = CorsLayer::new()
@@ -52,12 +62,16 @@ pub async fn start_server(host: Ipv4Addr, port: u16) {
         .route("/terminals/:pid/ws", get(terminal_websocket))
         .route("/terminals/:pid/terminate", post(terminate_terminal))
         .with_state(sessions)
-        .layer(cors);
+        .layer(cors)
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::default().include_headers(true)),
+        );
 
     let addr: std::net::SocketAddr = (host, port).into();
-    println!("Starting server on {:?}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    tracing::info!("listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -65,7 +79,7 @@ async fn create_terminal(
     State(sessions): State<Sessions>,
     Json(options): Json<TerminalOptions>,
 ) -> impl IntoResponse {
-    println!(
+    tracing::info!(
         "Creating new terminal with cols={}, rows={}",
         options.cols, options.rows
     );
@@ -87,7 +101,7 @@ async fn create_terminal(
             match pair.slave.spawn_command(cmd) {
                 Ok(child) => {
                     let pid = child.process_id().unwrap_or(0);
-                    println!("Terminal created successfully with PID: {}", pid);
+                    tracing::info!("Terminal created successfully with PID: {}", pid);
                     drop(pair.slave); // Release slave after spawning
 
                     let reader = Arc::new(Mutex::new(pair.master.try_clone_reader().unwrap()));
@@ -105,7 +119,7 @@ async fn create_terminal(
                     (axum::http::StatusCode::OK, pid.to_string()).into_response()
                 }
                 Err(e) => {
-                    println!("Failed to spawn command: {}", e);
+                    tracing::error!("Failed to spawn command: {}", e);
                     Json(ErrorResponse {
                         error: format!("Failed to spawn command: {}", e),
                     })
@@ -114,7 +128,7 @@ async fn create_terminal(
             }
         }
         Err(e) => {
-            println!("Failed to open PTY: {}", e);
+            tracing::error!("Failed to open PTY: {}", e);
             Json(ErrorResponse {
                 error: format!("Failed to open PTY: {}", e),
             })
@@ -128,7 +142,7 @@ async fn resize_terminal(
     Path(pid): Path<u32>,
     Json(options): Json<TerminalOptions>,
 ) -> impl IntoResponse {
-    println!(
+    tracing::info!(
         "Resizing terminal {} to cols={}, rows={}",
         pid, options.cols, options.rows
     );
@@ -161,7 +175,7 @@ async fn terminal_websocket(
     Path(pid): Path<u32>,
     State(sessions): State<Sessions>,
 ) -> impl IntoResponse {
-    println!("WebSocket connection request for terminal {}", pid);
+    tracing::info!("WebSocket connection request for terminal {}", pid);
     ws.on_upgrade(move |socket| handle_socket(socket, pid, sessions))
 }
 
@@ -170,7 +184,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions:
 
     let session_lock = sessions.lock().await;
     if let Some(session) = session_lock.get(&pid) {
-        println!("WebSocket connection established for terminal {}", pid);
+        tracing::info!("WebSocket connection established for terminal {}", pid);
         let reader = session.reader.clone();
         let writer = session.writer.clone();
         drop(session_lock);
@@ -197,7 +211,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions:
                         .send(axum::extract::ws::Message::Text(text))
                         .await
                     {
-                        println!("Failed to send WebSocket message for terminal {}", pid);
+                        tracing::error!("Failed to send WebSocket message for terminal {}", pid);
                         break;
                     }
                 }
@@ -209,15 +223,17 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions:
             match message {
                 axum::extract::ws::Message::Text(text) => {
                     let mut writer = writer.lock().await;
+                    tracing::info!("Get text data : {} and bytes : {:?} {:?}", text.clone(), text.clone().as_bytes(), text.clone().into_bytes());
                     if writer.write_all(text.as_bytes()).is_err() {
-                        println!("Failed to write to terminal {}", pid);
+                        tracing::error!("Failed to write to terminal {}", pid);
                         break;
                     }
                 }
                 axum::extract::ws::Message::Binary(data) => {
                     let mut writer = writer.lock().await;
+                    tracing::info!("Get bin data: {:?}", &data);
                     if writer.write_all(&data).is_err() {
-                        println!("Failed to write binary data to terminal {}", pid);
+                        tracing::error!("Failed to write binary data to terminal {}", pid);
                         break;
                     }
                 }
@@ -231,13 +247,13 @@ async fn terminate_terminal(
     State(sessions): State<Sessions>,
     Path(pid): Path<u32>,
 ) -> impl IntoResponse {
-    println!("Terminating terminal {}", pid);
+    tracing::info!("Terminating terminal {}", pid);
     let mut sessions = sessions.lock().await;
     if sessions.remove(&pid).is_some() {
-        println!("Terminal {} terminated successfully", pid);
+        tracing::info!("Terminal {} terminated successfully", pid);
         Json(serde_json::json!({"success": true})).into_response()
     } else {
-        println!("Failed to terminate terminal {}: session not found", pid);
+        tracing::error!("Failed to terminate terminal {}: session not found", pid);
         Json(ErrorResponse {
             error: "Session not found".to_string(),
         })

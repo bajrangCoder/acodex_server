@@ -26,12 +26,17 @@
     </head>
 
     <body>
+        <input type="text" id="inp"><button oonclick="sendt()">Send</button>
         <div id="terminal-container"></div>
 
         <!-- Include xterm.js and xterm-addon-fit.js scripts -->
         <script src="https://cdn.jsdelivr.net/npm/xterm/lib/xterm.js"></script>
         <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit/lib/xterm-addon-fit.js"></script>
         <script>
+        function sendt(){
+            let inp = document.querySelector("#inp").value;
+            window.so.send(inp+"\n")
+        }
             const baseURL = "http://localhost:8767";
 
             document.addEventListener("DOMContentLoaded", function () {
@@ -66,6 +71,7 @@
                         const socketURL = `ws://localhost:8767/terminals/${pid}/ws`;
                         const socket = new WebSocket(socketURL);
                         socket.binaryType = "arraybuffer";
+                        window.so=socket
 
                         // When data is received from the server, write it to the terminal
                         socket.onmessage = function (ev) {
@@ -79,7 +85,7 @@
 
                         // When data is typed in the terminal, send it to the server
                         term.onData((data) => _sendData(socket, data));
-                        term.onBinary((data) => _sendBinary(socket, data));
+                        //term.onBinary((data) => _sendBinary(socket, data));
 
                         // Handle terminal resize events
                         term.onResize(function (size) {
@@ -99,6 +105,21 @@
                                 }),
                             });
                         });
+                        setTimeout(()=>{
+                            let cols= term.cols;
+                            let rows= term.rows;
+                            fetch(`${baseURL}/terminals/${pid}/resize`, {
+                                method: "POST",
+                                headers: {
+                                    "Content-Type": "application/json",
+                                },
+                                body: JSON.stringify({
+                                    cols: cols,
+                                    rows: rows,
+                                }),
+                            });
+                            console.log("dome")
+                        }, 5000)
 
                         // Terminate the terminal session when the window is closed
                         window.onbeforeunload = function () {
