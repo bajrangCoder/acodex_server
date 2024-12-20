@@ -1,5 +1,8 @@
 use axum::{
-    extract::{Path, State, WebSocketUpgrade},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, State,
+    },
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -44,7 +47,7 @@ pub async fn start_server(host: Ipv4Addr, port: u16) {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                format!("{}=debug,tower_http=debug", env!("CARGO_CRATE_NAME")).into()
+                format!("{}=debug,tower_http=info", env!("CARGO_CRATE_NAME")).into()
             }),
         )
         .with(tracing_subscriber::fmt::layer())
@@ -81,7 +84,8 @@ async fn create_terminal(
 ) -> impl IntoResponse {
     tracing::info!(
         "Creating new terminal with cols={}, rows={}",
-        options.cols, options.rows
+        options.cols,
+        options.rows
     );
 
     let pty_system = native_pty_system();
@@ -144,7 +148,9 @@ async fn resize_terminal(
 ) -> impl IntoResponse {
     tracing::info!(
         "Resizing terminal {} to cols={}, rows={}",
-        pid, options.cols, options.rows
+        pid,
+        options.cols,
+        options.rows
     );
     let mut sessions = sessions.lock().await;
     if let Some(session) = sessions.get_mut(&pid) {
@@ -179,7 +185,7 @@ async fn terminal_websocket(
     ws.on_upgrade(move |socket| handle_socket(socket, pid, sessions))
 }
 
-async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions: Sessions) {
+async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
     let (sender, mut receiver) = socket.split();
 
     let session_lock = sessions.lock().await;
@@ -205,12 +211,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions:
                 };
 
                 if let Ok(text) = String::from_utf8(buffer[..n].to_vec()) {
-                    if let Err(_) = ws_sender_clone
-                        .lock()
-                        .await
-                        .send(axum::extract::ws::Message::Text(text))
-                        .await
-                    {
+                    if let Err(_) = ws_sender_clone.lock().await.send(Message::Text(text)).await {
                         tracing::error!("Failed to send WebSocket message for terminal {}", pid);
                         break;
                     }
@@ -220,20 +221,33 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, pid: u32, sessions:
 
         // Handle incoming WebSocket messages
         while let Some(Ok(message)) = receiver.next().await {
+            tracing::debug!("Received message from WebSocket: {:?}", message);
             match message {
-                axum::extract::ws::Message::Text(text) => {
+                Message::Text(text) => {
                     let mut writer = writer.lock().await;
-                    tracing::info!("Get text data : {} and bytes : {:?} {:?}", text.clone(), text.clone().as_bytes(), text.clone().into_bytes());
+                    tracing::info!(
+                        "Get text data : {} and bytes : {:?} {:?}",
+                        text.clone(),
+                        text.clone().as_bytes(),
+                        text.clone().into_bytes()
+                    );
                     if writer.write_all(text.as_bytes()).is_err() {
                         tracing::error!("Failed to write to terminal {}", pid);
                         break;
                     }
+                    if writer.flush().is_err() {
+                        tracing::error!("Failed to flush terminal {}", pid);
+                        break;
+                    }
                 }
-                axum::extract::ws::Message::Binary(data) => {
+                Message::Binary(data) => {
                     let mut writer = writer.lock().await;
-                    tracing::info!("Get bin data: {:?}", &data);
                     if writer.write_all(&data).is_err() {
                         tracing::error!("Failed to write binary data to terminal {}", pid);
+                        break;
+                    }
+                    if writer.flush().is_err() {
+                        tracing::error!("Failed to flush terminal {}", pid);
                         break;
                     }
                 }
