@@ -68,7 +68,7 @@
                         pid = pid.trim(); // Clean up the PID
 
                         // Connect to the terminal's WebSocket
-                        const socketURL = `ws://localhost:8767/terminals/${pid}/ws`;
+                        const socketURL = `ws://localhost:8767/terminals/${pid}`;
                         const socket = new WebSocket(socketURL);
                         socket.binaryType = "arraybuffer";
                         window.so=socket

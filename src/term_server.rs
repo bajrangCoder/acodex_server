@@ -62,7 +62,7 @@ pub async fn start_server(host: Ipv4Addr, port: u16) {
     let app = Router::new()
         .route("/terminals", post(create_terminal))
         .route("/terminals/:pid/resize", post(resize_terminal))
-        .route("/terminals/:pid/ws", get(terminal_websocket))
+        .route("/terminals/:pid", get(terminal_websocket))
         .route("/terminals/:pid/terminate", post(terminate_terminal))
         .with_state(sessions)
         .layer(cors)
@@ -186,74 +186,86 @@ async fn terminal_websocket(
 }
 
 async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
-    let (sender, mut receiver) = socket.split();
+    let (mut sender, mut receiver) = socket.split();
 
     let session_lock = sessions.lock().await;
     if let Some(session) = session_lock.get(&pid) {
         tracing::info!("WebSocket connection established for terminal {}", pid);
         let reader = session.reader.clone();
         let writer = session.writer.clone();
-        drop(session_lock);
+        drop(session_lock); // Drop the lock early to prevent deadlock
 
-        // Handle incoming data from PTY
-        let ws_sender = Arc::new(Mutex::new(sender));
-        let ws_sender_clone = ws_sender.clone();
+        // Handle PTY output to WebSocket
+        let pty_to_ws = {
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 1024];
+                loop {
+                    let n = {
+                        let mut reader = reader.lock().await;
+                        match reader.read(&mut buffer) {
+                            Ok(n) if n > 0 => n,
+                            _ => break,
+                        }
+                    };
 
-        tokio::spawn(async move {
-            let mut buffer = [0u8; 1024];
-            loop {
-                let n = {
-                    let mut reader = reader.lock().await;
-                    match reader.read(&mut buffer) {
-                        Ok(n) if n > 0 => n,
-                        _ => break,
+                    if let Ok(text) = String::from_utf8(buffer[..n].to_vec()) {
+                        if sender.send(Message::Text(text)).await.is_err() {
+                            tracing::error!(
+                                "Failed to send WebSocket message for terminal {}",
+                                pid
+                            );
+                            break;
+                        }
                     }
-                };
+                }
+            })
+        };
 
-                if let Ok(text) = String::from_utf8(buffer[..n].to_vec()) {
-                    if let Err(_) = ws_sender_clone.lock().await.send(Message::Text(text)).await {
-                        tracing::error!("Failed to send WebSocket message for terminal {}", pid);
+        // Handle WebSocket input to PTY
+        let ws_to_pty = {
+            tokio::spawn(async move {
+                while let Some(Ok(message)) = receiver.next().await {
+                    let mut writer = writer.lock().await;
+                    match message {
+                        Message::Text(text) => {
+                            if let Err(e) = writer.write_all(text.as_bytes()) {
+                                tracing::error!("Failed to write to terminal {}: {}", pid, e);
+                                break;
+                            }
+                        }
+                        Message::Binary(data) => {
+                            if let Err(e) = writer.write_all(&data) {
+                                tracing::error!(
+                                    "Failed to write binary data to terminal {}: {}",
+                                    pid,
+                                    e
+                                );
+                                break;
+                            }
+                        }
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+
+                    if let Err(e) = writer.flush() {
+                        tracing::error!("Failed to flush terminal {}: {}", pid, e);
                         break;
                     }
                 }
+            })
+        };
+
+        // Wait for either task to complete
+        tokio::select! {
+            _ = pty_to_ws => {
+                tracing::info!("PTY to WebSocket task completed for terminal {}", pid);
             }
-        });
-
-        // Handle incoming WebSocket messages
-        while let Some(Ok(message)) = receiver.next().await {
-            tracing::debug!("Received message from WebSocket: {:?}", message);
-            match message {
-                Message::Text(text) => {
-                    let mut writer = writer.lock().await;
-                    tracing::info!(
-                        "Get text data : {} and bytes : {:?} {:?}",
-                        text.clone(),
-                        text.clone().as_bytes(),
-                        text.clone().into_bytes()
-                    );
-                    if writer.write_all(text.as_bytes()).is_err() {
-                        tracing::error!("Failed to write to terminal {}", pid);
-                        break;
-                    }
-                    if writer.flush().is_err() {
-                        tracing::error!("Failed to flush terminal {}", pid);
-                        break;
-                    }
-                }
-                Message::Binary(data) => {
-                    let mut writer = writer.lock().await;
-                    if writer.write_all(&data).is_err() {
-                        tracing::error!("Failed to write binary data to terminal {}", pid);
-                        break;
-                    }
-                    if writer.flush().is_err() {
-                        tracing::error!("Failed to flush terminal {}", pid);
-                        break;
-                    }
-                }
-                _ => {}
+            _ = ws_to_pty => {
+                tracing::info!("WebSocket to PTY task completed for terminal {}", pid);
             }
         }
+    } else {
+        tracing::error!("Session {} not found", pid);
     }
 }
 
