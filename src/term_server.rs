@@ -33,8 +33,8 @@ type Sessions = Arc<Mutex<HashMap<u32, TerminalSession>>>;
 
 #[derive(Deserialize)]
 struct TerminalOptions {
-    cols: u16,
-    rows: u16,
+    cols: serde_json::Value,
+    rows: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,23 +78,38 @@ pub async fn start_server(host: Ipv4Addr, port: u16) {
     axum::serve(listener, app).await.unwrap();
 }
 
+// temporary to maintain compatibility with older AcodeX versions
+fn parse_u16(value: &serde_json::Value, field_name: &str) -> Result<u16, String> {
+    match value {
+        serde_json::Value::Number(n) if n.is_u64() => n
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .ok_or_else(|| format!("{} must be a valid u16.", field_name)),
+        serde_json::Value::String(s) => s
+            .parse::<u16>()
+            .map_err(|_| format!("{} must be a valid u16 string.", field_name)),
+        _ => Err(format!(
+            "{} must be a number or a valid string.",
+            field_name
+        )),
+    }
+}
+
 async fn create_terminal(
     State(sessions): State<Sessions>,
     Json(options): Json<TerminalOptions>,
 ) -> impl IntoResponse {
-    tracing::info!(
-        "Creating new terminal with cols={}, rows={}",
-        options.cols,
-        options.rows
-    );
+    let rows = parse_u16(&options.rows, "rows").expect("failed");
+    let cols = parse_u16(&options.cols, "cols").expect("failed");
+    tracing::info!("Creating new terminal with cols={}, rows={}", cols, rows);
 
     let pty_system = native_pty_system();
 
     let shell = &std::env::var("SHELL").unwrap_or_else(|_| String::from("bash"));
 
     let size = PtySize {
-        rows: options.rows,
-        cols: options.cols,
+        rows,
+        cols,
         pixel_width: 0,
         pixel_height: 0,
     };
@@ -146,17 +161,14 @@ async fn resize_terminal(
     Path(pid): Path<u32>,
     Json(options): Json<TerminalOptions>,
 ) -> impl IntoResponse {
-    tracing::info!(
-        "Resizing terminal {} to cols={}, rows={}",
-        pid,
-        options.cols,
-        options.rows
-    );
+    let rows = parse_u16(&options.rows, "rows").expect("Failed");
+    let cols = parse_u16(&options.cols, "cols").expect("Failed");
+    tracing::info!("Resizing terminal {} to cols={}, rows={}", pid, cols, rows);
     let mut sessions = sessions.lock().await;
     if let Some(session) = sessions.get_mut(&pid) {
         let size = PtySize {
-            rows: options.rows,
-            cols: options.cols,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         };

@@ -43,13 +43,10 @@ fn main() {
 fn get_ip_address() -> Option<Ipv4Addr> {
     for iface in datalink::interfaces() {
         for ip in iface.ips {
-            match ip {
-                pnet::ipnetwork::IpNetwork::V4(network) => {
-                    if !network.ip().is_loopback() {
-                        return Some(network.ip());
-                    }
+            if let pnet::ipnetwork::IpNetwork::V4(network) = ip {
+                if !network.ip().is_loopback() {
+                    return Some(network.ip());
                 }
-                _ => {}
             }
         }
     }
