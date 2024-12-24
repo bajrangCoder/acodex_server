@@ -10,6 +10,7 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
+use std::time::SystemTime;
 use std::{
     collections::HashMap,
     io::{Read, Write},
@@ -21,12 +22,21 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+const MAX_BUFFER_SIZE: usize = 1_000_000;
+
+struct CircularBuffer {
+    data: Vec<u8>,
+    position: usize,
+    max_size: usize,
+}
+
 #[allow(dead_code)]
 struct TerminalSession {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     reader: Arc<Mutex<Box<dyn Read + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    buffer: String,
+    buffer: Arc<Mutex<CircularBuffer>>,
+    last_accessed: Arc<Mutex<SystemTime>>,
 }
 
 type Sessions = Arc<Mutex<HashMap<u32, TerminalSession>>>;
@@ -40,6 +50,38 @@ struct TerminalOptions {
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+impl CircularBuffer {
+    fn new(max_size: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(max_size),
+            position: 0,
+            max_size,
+        }
+    }
+
+    fn write(&mut self, new_data: &[u8]) {
+        for &byte in new_data {
+            if self.data.len() < self.max_size {
+                self.data.push(byte);
+            } else {
+                self.data[self.position] = byte;
+                self.position = (self.position + 1) % self.max_size;
+            }
+        }
+    }
+
+    fn get_contents(&self) -> Vec<u8> {
+        if self.data.len() < self.max_size {
+            self.data.clone()
+        } else {
+            let mut result = Vec::with_capacity(self.max_size);
+            result.extend_from_slice(&self.data[self.position..]);
+            result.extend_from_slice(&self.data[..self.position]);
+            result
+        }
+    }
 }
 
 #[tokio::main]
@@ -131,7 +173,8 @@ async fn create_terminal(
                         master,
                         reader,
                         writer,
-                        buffer: String::new(),
+                        buffer: Arc::new(Mutex::new(CircularBuffer::new(MAX_BUFFER_SIZE))),
+                        last_accessed: Arc::new(Mutex::new(SystemTime::now())),
                     };
 
                     sessions.lock().await.insert(pid, session);
@@ -202,30 +245,49 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
 
     let session_lock = sessions.lock().await;
     if let Some(session) = session_lock.get(&pid) {
+        // Update last accessed time
+        let mut last_accessed = session.last_accessed.lock().await;
+        *last_accessed = SystemTime::now();
+        drop(last_accessed);
+
         tracing::info!("WebSocket connection established for terminal {}", pid);
         let reader = session.reader.clone();
         let writer = session.writer.clone();
-        drop(session_lock); // Drop the lock early to prevent deadlock
+        let buffer = session.buffer.clone();
+        drop(session_lock);
+
+        // Send initial buffer contents
+        let buffer_guard = buffer.lock().await;
+        if let Ok(initial_content) = String::from_utf8(buffer_guard.get_contents()) {
+            if !initial_content.is_empty() {
+                let _ = sender.send(Message::Text(initial_content)).await;
+            }
+        }
+        drop(buffer_guard);
 
         // Handle PTY output to WebSocket
         let pty_to_ws = {
+            let buffer = buffer.clone();
             tokio::spawn(async move {
-                let mut buffer = [0u8; 1024];
+                let mut read_buffer = [0u8; 1024];
                 loop {
                     let n = {
                         let mut reader = reader.lock().await;
-                        match reader.read(&mut buffer) {
+                        match reader.read(&mut read_buffer) {
                             Ok(n) if n > 0 => n,
                             _ => break,
                         }
                     };
 
-                    if let Ok(text) = String::from_utf8(buffer[..n].to_vec()) {
+                    let data = &read_buffer[..n];
+
+                    // Update circular buffer
+                    let mut buffer_guard = buffer.lock().await;
+                    buffer_guard.write(data);
+                    drop(buffer_guard);
+
+                    if let Ok(text) = String::from_utf8(data.to_vec()) {
                         if sender.send(Message::Text(text)).await.is_err() {
-                            tracing::error!(
-                                "Failed to send WebSocket message for terminal {}",
-                                pid
-                            );
                             break;
                         }
                     }
@@ -233,7 +295,7 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
             })
         };
 
-        // Handle WebSocket input to PTY
+        // Rest of your handle_socket implementation remains the same
         let ws_to_pty = {
             tokio::spawn(async move {
                 while let Some(Ok(message)) = receiver.next().await {

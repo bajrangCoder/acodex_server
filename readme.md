@@ -3,14 +3,15 @@
 > [!WARNING]
 > **acodex_server** is currently **under development**. Some features may be incomplete or subject to change or not implemented yet. Use it with caution.
 
-`acodex_server` is a Rust-based backend/server for the `Acodex plugin`. It provides a **lightweight**, **independent**, **secure**, and **blazingly fast** solution.
+`acodex_server` is a Rust-based backend/server for the `Acodex plugin`. It provides a **lightweight**, **independent**, **secure**, and **fast** solution.
 
 ## Features
 
 - Lightweight
 - Independent (serves as a binary)
 - Secure
-- Blazingly fast
+- fast
+- uses system pty
 
 ## Usage
 
