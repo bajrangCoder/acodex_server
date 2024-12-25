@@ -17,6 +17,6 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: cargo build --release --verbose
+      run: cargo build --release --target=aarch64-linux-android --target=armv7-linux-androideabi --target=x86_64-linux-android
     - name: Run tests
       run: cargo test --verbose
