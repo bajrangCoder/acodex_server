@@ -16,6 +16,11 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: add target
+      run: |
+           rustup target add aarch64-linux-android
+           rustup target add armv7-linux-androideabi
+           rustup target add x86_64-linux-android
     - name: Build
       run: cargo build --release --target=aarch64-linux-android --target=armv7-linux-androideabi --target=x86_64-linux-android
     - name: Run tests
