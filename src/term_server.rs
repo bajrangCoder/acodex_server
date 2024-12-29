@@ -9,15 +9,19 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use std::{
     collections::HashMap,
     io::{Read, Write},
     net::Ipv4Addr,
-    sync::Arc,
+    path::PathBuf,
+    sync::{mpsc, Arc},
+    time::Duration,
 };
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -45,6 +49,18 @@ type Sessions = Arc<Mutex<HashMap<u32, TerminalSession>>>;
 struct TerminalOptions {
     cols: serde_json::Value,
     rows: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct ExecuteCommandOption {
+    command: String,
+    cwd: String,
+}
+
+#[derive(Serialize)]
+pub struct CommandResponse {
+    output: String,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +122,7 @@ pub async fn start_server(host: Ipv4Addr, port: u16) {
         .route("/terminals/:pid/resize", post(resize_terminal))
         .route("/terminals/:pid", get(terminal_websocket))
         .route("/terminals/:pid/terminate", post(terminate_terminal))
+        .route("/execute-command", post(execute_command))
         .with_state(sessions)
         .layer(cors)
         .layer(
@@ -359,4 +376,163 @@ async fn terminate_terminal(
         })
         .into_response()
     }
+}
+
+async fn execute_command(Json(options): Json<ExecuteCommandOption>) -> impl IntoResponse {
+    tracing::info!(
+        command = %options.command,
+        cwd = %options.cwd,
+        "Executing command"
+    );
+
+    let shell = &std::env::var("SHELL").unwrap_or_else(|_| String::from("bash"));
+
+    // Validate working directory
+    let cwd = if options.cwd.is_empty() {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    } else {
+        PathBuf::from(&options.cwd)
+    };
+
+    if !cwd.exists() {
+        tracing::error!(path = ?cwd, "Working directory does not exist");
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(CommandResponse {
+                output: String::new(),
+                error: Some("Working directory does not exist".to_string()),
+            }),
+        )
+            .into_response();
+    }
+
+    // Set up PTY
+    let pty_system = native_pty_system();
+
+    // Create PTY pair
+    let size = PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+
+    let pair = match pty_system.openpty(size) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to open PTY");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(CommandResponse {
+                    output: String::new(),
+                    error: Some("Failed to create PTY".to_string()),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let mut cmd = CommandBuilder::new(shell);
+    cmd.args(["-c", &options.command]);
+    cmd.cwd(cwd);
+
+    // Spawn the command
+    let mut child = match pair.slave.spawn_command(cmd) {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to spawn command");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(CommandResponse {
+                    output: String::new(),
+                    error: Some("Failed to spawn command".to_string()),
+                }),
+            )
+                .into_response();
+        }
+    };
+    drop(pair.slave);
+
+    // Set up output reading
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let writer = pair.master.take_writer().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    // Write command and read output in separate threads
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).ok();
+        tx.send(output).ok();
+    });
+
+    // Wait for command completion with timeout
+    let timeout_duration = Duration::from_secs(30);
+    if (timeout(timeout_duration, async {
+        match child.wait() {
+            Ok(status) => {
+                tracing::info!(
+                     exit_code = ?status.exit_code(),
+                     "Command completed"
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Command failed");
+            }
+        }
+    })
+    .await)
+        .is_err()
+    {
+        tracing::warn!("Command execution timed out");
+        child.kill().ok();
+        return (
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            Json(CommandResponse {
+                output: String::new(),
+                error: Some("Command execution timed out".to_string()),
+            }),
+        )
+            .into_response();
+    }
+
+    // Clean up resources
+    drop(writer);
+    drop(pair.master);
+
+    // Get command output
+    let output = match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(output) => String::from_utf8_lossy(&output).into_owned(),
+        Err(_) => {
+            tracing::error!("Failed to receive command output");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(CommandResponse {
+                    output: String::new(),
+                    error: Some("Failed to receive command output".to_string()),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // Clean ANSI escape sequences
+    let ansi_regex =
+        Regex::new(r"\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]|\x1B\[[0-9]+[A-Za-z]").unwrap();
+    let cleaned_output = ansi_regex.replace_all(&output, "").to_string();
+
+    tracing::info!(
+        output_length = cleaned_output.len(),
+        "Command output processed"
+    );
+
+    (
+        axum::http::StatusCode::OK,
+        Json(CommandResponse {
+            output: cleaned_output,
+            error: None,
+        }),
+    )
+        .into_response()
 }
