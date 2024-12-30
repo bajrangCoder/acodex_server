@@ -21,7 +21,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::Mutex;
-use tokio::time::timeout;
+use tokio::task::spawn_blocking;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -54,7 +54,8 @@ struct TerminalOptions {
 #[derive(Deserialize)]
 struct ExecuteCommandOption {
     command: String,
-    cwd: String,
+    cwd: Option<String>,
+    u_cwd: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -282,67 +283,74 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
         }
         drop(buffer_guard);
 
-        // Handle PTY output to WebSocket
         let pty_to_ws = {
             let buffer = buffer.clone();
+            let reader = reader.clone();
+
             tokio::spawn(async move {
-                let mut read_buffer = [0u8; 1024];
-                loop {
-                    let n = {
-                        let mut reader = reader.lock().await;
-                        match reader.read(&mut read_buffer) {
-                            Ok(n) if n > 0 => n,
-                            _ => break,
-                        }
-                    };
+                spawn_blocking(move || {
+                    let mut read_buffer = [0u8; 1024];
+                    loop {
+                        let n = {
+                            let mut reader_guard = reader.blocking_lock();
+                            match reader_guard.read(&mut read_buffer) {
+                                Ok(n) if n > 0 => n,
+                                _ => break,
+                            }
+                        };
 
-                    let data = &read_buffer[..n];
+                        let data = read_buffer[..n].to_vec();
 
-                    // Update circular buffer
-                    let mut buffer_guard = buffer.lock().await;
-                    buffer_guard.write(data);
-                    drop(buffer_guard);
-
-                    if let Ok(text) = String::from_utf8(data.to_vec()) {
-                        if sender.send(Message::Text(text)).await.is_err() {
-                            break;
+                        if let Ok(text) = String::from_utf8(data.clone()) {
+                            let rt = tokio::runtime::Handle::current();
+                            if !rt.block_on(async {
+                                let mut buffer_guard = buffer.lock().await;
+                                buffer_guard.write(&data);
+                                sender.send(Message::Text(text)).await.is_ok()
+                            }) {
+                                break;
+                            }
                         }
                     }
-                }
+                })
+                .await
+                .ok();
             })
         };
 
-        // Rest of your handle_socket implementation remains the same
+        // Handle WebSocket input to PTY
         let ws_to_pty = {
+            let writer = writer.clone();
             tokio::spawn(async move {
-                while let Some(Ok(message)) = receiver.next().await {
-                    let mut writer = writer.lock().await;
-                    match message {
-                        Message::Text(text) => {
-                            if let Err(e) = writer.write_all(text.as_bytes()) {
-                                tracing::error!("Failed to write to terminal {}: {}", pid, e);
-                                break;
-                            }
-                        }
-                        Message::Binary(data) => {
-                            if let Err(e) = writer.write_all(&data) {
-                                tracing::error!(
-                                    "Failed to write binary data to terminal {}: {}",
-                                    pid,
-                                    e
-                                );
-                                break;
-                            }
-                        }
-                        Message::Close(_) => break,
-                        _ => {}
-                    }
+                let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                let tx = std::sync::Arc::new(tx);
+                let tx_clone = tx.clone();
 
-                    if let Err(e) = writer.flush() {
-                        tracing::error!("Failed to flush terminal {}: {}", pid, e);
+                let write_handle = spawn_blocking(move || {
+                    while let Ok(data) = rx.recv() {
+                        let mut writer_guard = writer.blocking_lock();
+                        if writer_guard.write_all(&data).is_err() || writer_guard.flush().is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                while let Some(Ok(message)) = receiver.next().await {
+                    let data = match message {
+                        Message::Text(text) => text.into_bytes(),
+                        Message::Binary(data) => data,
+                        Message::Close(_) => break,
+                        _ => continue,
+                    };
+
+                    if tx_clone.send(data).is_err() {
                         break;
                     }
                 }
+
+                // Clean up
+                drop(tx_clone);
+                let _ = write_handle.await;
             })
         };
 
@@ -379,25 +387,24 @@ async fn terminate_terminal(
 }
 
 async fn execute_command(Json(options): Json<ExecuteCommandOption>) -> impl IntoResponse {
+    let cwd = options.cwd.or(options.u_cwd).unwrap();
+
     tracing::info!(
         command = %options.command,
-        cwd = %options.cwd,
+        cwd = %cwd,
         "Executing command"
     );
 
-    let shell = &std::env::var("SHELL").unwrap_or_else(|_| String::from("bash"));
-
-    // Validate working directory
-    let cwd = if options.cwd.is_empty() {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| String::from("bash"));
+    let cwd = if cwd.is_empty() {
         std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     } else {
-        PathBuf::from(&options.cwd)
+        PathBuf::from(cwd)
     };
 
     if !cwd.exists() {
-        tracing::error!(path = ?cwd, "Working directory does not exist");
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(CommandResponse {
@@ -408,131 +415,131 @@ async fn execute_command(Json(options): Json<ExecuteCommandOption>) -> impl Into
             .into_response();
     }
 
-    // Set up PTY
-    let pty_system = native_pty_system();
+    let command = options.command.clone();
 
-    // Create PTY pair
-    let size = PtySize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 0,
-        pixel_height: 0,
-    };
+    // Execute command in a blocking task
+    let result = spawn_blocking(move || {
+        // Set up PTY
+        let pty_system = native_pty_system();
+        let size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
 
-    let pair = match pty_system.openpty(size) {
-        Ok(pair) => pair,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to open PTY");
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(CommandResponse {
-                    output: String::new(),
-                    error: Some("Failed to create PTY".to_string()),
-                }),
-            )
-                .into_response();
-        }
-    };
+        let pair = pty_system.openpty(size)?;
 
-    let mut cmd = CommandBuilder::new(shell);
-    cmd.args(["-c", &options.command]);
-    cmd.cwd(cwd);
+        // Set up command
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.args(["-c", &command]);
+        cmd.cwd(cwd);
 
-    // Spawn the command
-    let mut child = match pair.slave.spawn_command(cmd) {
-        Ok(child) => child,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to spawn command");
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(CommandResponse {
-                    output: String::new(),
-                    error: Some("Failed to spawn command".to_string()),
-                }),
-            )
-                .into_response();
-        }
-    };
-    drop(pair.slave);
+        // Spawn the command
+        let mut child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
 
-    // Set up output reading
-    let mut reader = pair.master.try_clone_reader().unwrap();
-    let writer = pair.master.take_writer().unwrap();
-    let (tx, rx) = mpsc::channel();
+        let mut reader = pair.master.try_clone_reader()?;
+        let writer = pair.master.take_writer()?;
 
-    // Write command and read output in separate threads
-    std::thread::spawn(move || {
+        // Create channel for reading output
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+        // Spawn a thread for reading
+        let read_thread = std::thread::spawn(move || {
+            let mut buffer = [0u8; 1024];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        if tx.send(buffer[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Collect output with timeout
+        let timeout_duration = Duration::from_secs(30);
+        let start_time = SystemTime::now();
         let mut output = Vec::new();
-        reader.read_to_end(&mut output).ok();
-        tx.send(output).ok();
-    });
 
-    // Wait for command completion with timeout
-    let timeout_duration = Duration::from_secs(30);
-    if (timeout(timeout_duration, async {
-        match child.wait() {
-            Ok(status) => {
-                tracing::info!(
-                     exit_code = ?status.exit_code(),
-                     "Command completed"
-                );
+        loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(data) => {
+                    output.extend(data);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if start_time.elapsed().unwrap_or_default() > timeout_duration {
+                        child.kill()?;
+                        return Err("Command execution timed out".into());
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            Err(e) => {
-                tracing::error!(error = %e, "Command failed");
+
+            // Check if process has finished
+            if let Ok(Some(_)) = child.try_wait() {
+                break;
             }
         }
+
+        // Clean up resources
+        drop(writer);
+        let _ = read_thread.join();
+        child.wait()?;
+
+        Ok::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(output)
     })
-    .await)
-        .is_err()
-    {
-        tracing::warn!("Command execution timed out");
-        child.kill().ok();
-        return (
-            axum::http::StatusCode::REQUEST_TIMEOUT,
-            Json(CommandResponse {
-                output: String::new(),
-                error: Some("Command execution timed out".to_string()),
-            }),
-        )
-            .into_response();
-    }
+    .await;
 
-    // Clean up resources
-    drop(writer);
-    drop(pair.master);
+    // Process the result
+    match result {
+        Ok(Ok(output)) => {
+            let output_str = String::from_utf8_lossy(&output).into_owned();
 
-    // Get command output
-    let output = match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(output) => String::from_utf8_lossy(&output).into_owned(),
-        Err(_) => {
-            tracing::error!("Failed to receive command output");
-            return (
+            // Clean ANSI escape sequences
+            let ansi_regex =
+                Regex::new(r"\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]|\x1B\[[0-9]+[A-Za-z]").unwrap();
+            let cleaned_output = ansi_regex.replace_all(&output_str, "").to_string();
+
+            tracing::info!(
+                output_length = cleaned_output.len(),
+                "Command completed successfully"
+            );
+
+            (
+                axum::http::StatusCode::OK,
+                Json(CommandResponse {
+                    output: cleaned_output,
+                    error: None,
+                }),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::error!("Command execution failed: {}", e);
+            (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(CommandResponse {
                     output: String::new(),
-                    error: Some("Failed to receive command output".to_string()),
+                    error: Some(e.to_string()),
                 }),
             )
-                .into_response();
+                .into_response()
         }
-    };
-
-    // Clean ANSI escape sequences
-    let ansi_regex =
-        Regex::new(r"\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]|\x1B\[[0-9]+[A-Za-z]").unwrap();
-    let cleaned_output = ansi_regex.replace_all(&output, "").to_string();
-
-    tracing::info!(
-        output_length = cleaned_output.len(),
-        "Command output processed"
-    );
-
-    (
-        axum::http::StatusCode::OK,
-        Json(CommandResponse {
-            output: cleaned_output,
-            error: None,
-        }),
-    )
-        .into_response()
+        Err(e) => {
+            tracing::error!("Blocking task failed: {}", e);
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(CommandResponse {
+                    output: String::new(),
+                    error: Some("Internal server error".to_string()),
+                }),
+            )
+                .into_response()
+        }
+    }
 }
