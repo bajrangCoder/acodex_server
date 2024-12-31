@@ -23,7 +23,7 @@ jobs:
             target: x86_64-linux-android
             bin: axs-android-x64
         toolchain:
-          - stable
+          - nightly
     steps:
       - uses: actions/checkout@v3
       
