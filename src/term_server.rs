@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use futures::{SinkExt, StreamExt};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
@@ -37,6 +37,7 @@ struct CircularBuffer {
 #[allow(dead_code)]
 struct TerminalSession {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    child_killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
     reader: Arc<Mutex<Box<dyn Read + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     buffer: Arc<Mutex<CircularBuffer>>,
@@ -186,9 +187,11 @@ async fn create_terminal(
                     let reader = Arc::new(Mutex::new(pair.master.try_clone_reader().unwrap()));
                     let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
                     let master = Arc::new(Mutex::new(pair.master as Box<dyn MasterPty + Send>));
+                    let child_killer = Arc::new(Mutex::new(child.clone_killer()));
 
                     let session = TerminalSession {
                         master,
+                        child_killer,
                         reader,
                         writer,
                         buffer: Arc::new(Mutex::new(CircularBuffer::new(MAX_BUFFER_SIZE))),
@@ -374,9 +377,37 @@ async fn terminate_terminal(
 ) -> impl IntoResponse {
     tracing::info!("Terminating terminal {}", pid);
     let mut sessions = sessions.lock().await;
-    if sessions.remove(&pid).is_some() {
-        tracing::info!("Terminal {} terminated successfully", pid);
-        Json(serde_json::json!({"success": true})).into_response()
+
+    if let Some(session) = sessions.remove(&pid) {
+        let result = {
+            session
+                .child_killer
+                .lock()
+                .await
+                .kill()
+                .map_err(|e| e.to_string())
+        };
+        drop(session.writer.lock().await);
+        drop(session.reader.lock().await);
+
+        // Clear the circular buffer
+        if let Ok(mut buffer) = session.buffer.try_lock() {
+            buffer.data.clear();
+        }
+
+        match result {
+            Ok(_) => {
+                tracing::info!("Terminal {} terminated successfully", pid);
+                Json(serde_json::json!({"success": true})).into_response()
+            }
+            Err(e) => {
+                tracing::error!("Failed to terminate terminal {}: {}", pid, e);
+                Json(ErrorResponse {
+                    error: format!("Failed to terminate terminal {}: {}", pid, e),
+                })
+                .into_response()
+            }
+        }
     } else {
         tracing::error!("Failed to terminate terminal {}: session not found", pid);
         Json(ErrorResponse {
