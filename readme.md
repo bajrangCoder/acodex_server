@@ -12,6 +12,8 @@
 
 ## Usage
 
+> Install beta version from releases section.
+
 To use `acodex_server`, follow these steps:
 
 1. **Install from Source:**
