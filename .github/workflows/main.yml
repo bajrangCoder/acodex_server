@@ -22,10 +22,14 @@ jobs:
           ndk-version: r25c
 
       - name: Build for Android
+        env:
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ env.ANDROID_NDK_ROOT }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
+          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER: ${{ env.ANDROID_NDK_ROOT }}/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang
+          CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER: ${{ env.ANDROID_NDK_ROOT }}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang
         run: |
-          export NDK_HOME=$ANDROID_NDK_ROOT
-          cargo install cargo-ndk
-          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 build --release
+          cargo build --target aarch64-linux-android --release
+          cargo build --target armv7-linux-androideabi --release
+          cargo build --target x86_64-linux-android --release
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
