@@ -1,11 +1,11 @@
-extern crate pnet;
-mod term_server;
+mod terminal;
+mod utils;
 
 use clap::Parser;
 use colored::Colorize;
-use pnet::datalink;
 use std::net::Ipv4Addr;
-use term_server::*;
+use terminal::start_server;
+use utils::get_ip_address;
 
 const DEFAULT_PORT: u16 = 8767;
 const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
@@ -38,17 +38,4 @@ fn main() {
     };
 
     start_server(ip, cli.port);
-}
-
-fn get_ip_address() -> Option<Ipv4Addr> {
-    for iface in datalink::interfaces() {
-        for ip in iface.ips {
-            if let pnet::ipnetwork::IpNetwork::V4(network) = ip {
-                if !network.ip().is_loopback() {
-                    return Some(network.ip());
-                }
-            }
-        }
-    }
-    None
 }

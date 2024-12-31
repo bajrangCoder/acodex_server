@@ -1,162 +1,38 @@
+use super::buffer::CircularBuffer;
+use super::types::*;
+use crate::utils::parse_u16;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, State,
     },
     response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
+    Json,
 };
 use futures::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::time::SystemTime;
 use std::{
-    collections::HashMap,
-    io::{Read, Write},
-    net::Ipv4Addr,
+    io::Read,
     path::PathBuf,
     sync::{mpsc, Arc},
     time::Duration,
 };
 use tokio::sync::Mutex;
 use tokio::task::spawn_blocking;
-use tower_http::cors::{Any, CorsLayer};
-use tower_http::trace::{DefaultMakeSpan, TraceLayer};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-const MAX_BUFFER_SIZE: usize = 1_000_000;
-
-struct CircularBuffer {
-    data: Vec<u8>,
-    position: usize,
-    max_size: usize,
+pub struct TerminalSession {
+    pub master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    pub child_killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+    pub reader: Arc<Mutex<Box<dyn Read + Send>>>,
+    pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    pub buffer: Arc<Mutex<CircularBuffer>>,
+    pub last_accessed: Arc<Mutex<SystemTime>>,
 }
 
-#[allow(dead_code)]
-struct TerminalSession {
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    child_killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
-    reader: Arc<Mutex<Box<dyn Read + Send>>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    buffer: Arc<Mutex<CircularBuffer>>,
-    last_accessed: Arc<Mutex<SystemTime>>,
-}
-
-type Sessions = Arc<Mutex<HashMap<u32, TerminalSession>>>;
-
-#[derive(Deserialize)]
-struct TerminalOptions {
-    cols: serde_json::Value,
-    rows: serde_json::Value,
-}
-
-#[derive(Deserialize)]
-struct ExecuteCommandOption {
-    command: String,
-    cwd: Option<String>,
-    u_cwd: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct CommandResponse {
-    output: String,
-    error: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ErrorResponse {
-    error: String,
-}
-
-impl CircularBuffer {
-    fn new(max_size: usize) -> Self {
-        Self {
-            data: Vec::with_capacity(max_size),
-            position: 0,
-            max_size,
-        }
-    }
-
-    fn write(&mut self, new_data: &[u8]) {
-        for &byte in new_data {
-            if self.data.len() < self.max_size {
-                self.data.push(byte);
-            } else {
-                self.data[self.position] = byte;
-                self.position = (self.position + 1) % self.max_size;
-            }
-        }
-    }
-
-    fn get_contents(&self) -> Vec<u8> {
-        if self.data.len() < self.max_size {
-            self.data.clone()
-        } else {
-            let mut result = Vec::with_capacity(self.max_size);
-            result.extend_from_slice(&self.data[self.position..]);
-            result.extend_from_slice(&self.data[..self.position]);
-            result
-        }
-    }
-}
-
-#[tokio::main]
-pub async fn start_server(host: Ipv4Addr, port: u16) {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                format!("{}=debug,tower_http=info", env!("CARGO_CRATE_NAME")).into()
-            }),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
-
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
-    let app = Router::new()
-        .route("/terminals", post(create_terminal))
-        .route("/terminals/:pid/resize", post(resize_terminal))
-        .route("/terminals/:pid", get(terminal_websocket))
-        .route("/terminals/:pid/terminate", post(terminate_terminal))
-        .route("/execute-command", post(execute_command))
-        .with_state(sessions)
-        .layer(cors)
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::default().include_headers(true)),
-        );
-
-    let addr: std::net::SocketAddr = (host, port).into();
-
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    tracing::info!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
-}
-
-// temporary to maintain compatibility with older AcodeX versions
-fn parse_u16(value: &serde_json::Value, field_name: &str) -> Result<u16, String> {
-    match value {
-        serde_json::Value::Number(n) if n.is_u64() => n
-            .as_u64()
-            .and_then(|n| u16::try_from(n).ok())
-            .ok_or_else(|| format!("{} must be a valid u16.", field_name)),
-        serde_json::Value::String(s) => s
-            .parse::<u16>()
-            .map_err(|_| format!("{} must be a valid u16 string.", field_name)),
-        _ => Err(format!(
-            "{} must be a number or a valid string.",
-            field_name
-        )),
-    }
-}
-
-async fn create_terminal(
+pub async fn create_terminal(
     State(sessions): State<Sessions>,
     Json(options): Json<TerminalOptions>,
 ) -> impl IntoResponse {
@@ -220,7 +96,7 @@ async fn create_terminal(
     }
 }
 
-async fn resize_terminal(
+pub async fn resize_terminal(
     State(sessions): State<Sessions>,
     Path(pid): Path<u32>,
     Json(options): Json<TerminalOptions>,
@@ -252,7 +128,7 @@ async fn resize_terminal(
     }
 }
 
-async fn terminal_websocket(
+pub async fn terminal_websocket(
     ws: WebSocketUpgrade,
     Path(pid): Path<u32>,
     State(sessions): State<Sessions>,
@@ -371,7 +247,7 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
     }
 }
 
-async fn terminate_terminal(
+pub async fn terminate_terminal(
     State(sessions): State<Sessions>,
     Path(pid): Path<u32>,
 ) -> impl IntoResponse {
@@ -417,7 +293,7 @@ async fn terminate_terminal(
     }
 }
 
-async fn execute_command(Json(options): Json<ExecuteCommandOption>) -> impl IntoResponse {
+pub async fn execute_command(Json(options): Json<ExecuteCommandOption>) -> impl IntoResponse {
     let cwd = options.cwd.or(options.u_cwd).unwrap();
 
     tracing::info!(
