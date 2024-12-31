@@ -8,7 +8,7 @@ permissions:
 jobs:
   build:
     name: ${{ matrix.platform.os_name }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-arm
     strategy:
       fail-fast: false
       matrix:
