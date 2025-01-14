@@ -1,16 +1,18 @@
-name: build and release
+name: CI Pipeline
+
 on:
-  workflow_dispatch:
-  release:
-    types: [created]
-permissions:
-  contents: write
+  push:
+    branches: [main]
+  pull_request: {}
+
+env:
+  RUST_BACKTRACE: 1
+
 jobs:
-  build:
-    name: ${{ matrix.platform.os_name }}
-    runs-on: ubuntu-latest-arm
+  # Build for Android platforms
+  build-android:
+    runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
         platform:
           - os_name: Android-aarch64
@@ -22,29 +24,69 @@ jobs:
           - os_name: Android-x86_64
             target: x86_64-linux-android
             bin: axs-android-x64
-        toolchain:
-          - nightly
     steps:
-      - uses: actions/checkout@v3
-      
-      - name: Build binary
-        uses: houseabsolute/actions-rust-cross@v0
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install Rust and Android targets
+        uses: dtolnay/rust-toolchain@stable
         with:
-          command: "build"
-          target: ${{ matrix.platform.target }}
-          toolchain: ${{ matrix.toolchain }}
-          args: "--release"
-          strip: true
+          targets: ${{ matrix.platform.target }}
+
+      - name: Set up Android NDK
+        uses: android-actions/setup-ndk@v2
+        with:
+          ndk-version: r25c
+
+      - name: Build for Android
+        run: |
+          export CARGO_TARGET_${{ matrix.platform.target | upper | replace("-", "_") }}_AR=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          export CARGO_TARGET_${{ matrix.platform.target | upper | replace("-", "_") }}_CC=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.platform.target }}-clang
+          cargo build --release --target ${{ matrix.platform.target }}
 
       - name: Rename binary
-        run: mv target/${{ matrix.platform.target }}/release/axs target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }}
+        run: mv target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }} ./axs-${{ matrix.platform.os_name }}
 
-      - name: Generate SHA-256
-        run: shasum -a 256 target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }} | cut -d ' ' -f 1 > target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }}.sha256
+  # Tests for all platforms
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        musl: [true, false]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-      - name: Release binary and checksum
-        uses: softprops/action-gh-release@v1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies for musl (only if needed)
+        if: ${{ matrix.musl == 'true' }}
+        run: sudo apt-get install clang-11 musl-tools
+
+      - name: Run tests
+        run: |
+          if [ "${{ matrix.musl }}" == "true" ]; then
+            TARGET_CC=clang-11 TARGET_AR=llvm-ar-11 cargo test --target x86_64-unknown-linux-musl;
+          else
+            cargo test;
+          fi
+
+  # Linting job
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install Rust with Clippy and Rustfmt
+        uses: dtolnay/rust-toolchain@stable
         with:
-          files: |
-            target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }}
-            target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }}.sha256
+          components: clippy, rustfmt
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run Rustfmt
+        run: cargo fmt --check
