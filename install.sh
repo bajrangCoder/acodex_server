@@ -33,8 +33,8 @@ download_binary() {
 
     # Move the binary to the PREFIX directory and rename it to 'axs'
     echo "Installing axs binary to $PREFIX..."
-    mv "$FILE_NAME" "$PREFIX/axs"
-    chmod +x "$PREFIX/axs"
+    mv "$FILE_NAME" "$PREFIX/bin/axs"
+    chmod +x "$PREFIX/bin/axs"
 
     echo "Binary downloaded and installed as 'axs'. You can now use the 'axs' command!"
 }
