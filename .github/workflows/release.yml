@@ -2,8 +2,9 @@ name: Release
 
 on:
   workflow_dispatch:
-  release:
-    types: [created, published]
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
