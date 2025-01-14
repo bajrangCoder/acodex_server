@@ -10,27 +10,21 @@
 - fast
 - uses system pty
 
-## Usage
+## Installation
 
-> Install beta version from releases section.
+To install `axs` on your system, simply use the following command:
 
-To use `acodex_server`, follow these steps:
+```bash
+curl -L https://raw.githubusercontent.com/bajrangCoder/acodex_server/main/install.sh | bash
+```
 
-1. **Install from Source:**
-   - Clone the repository.
-   - Ensure that Rust is installed on your system.
-   - Navigate to the project directory.
-   - Build the project:
-     ```bash
-     cargo build --release
-     ```
+### Example Usage
+```bash
+axs --help
+```
 
-2. **Run the Binary:**
-   - After building, the binary will be available in `/target/release/axs`.
-   - Run the binary:
-     ```bash
-     ./target/release/axs --help
-     ```
+> [!NOTE]
+> If you encounter any issues, please [create an issue on GitHub](https://github.com/bajrangCoder/acodex_server/issues).
 
 ## Building from Source
 
