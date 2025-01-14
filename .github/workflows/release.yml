@@ -1,9 +1,9 @@
 name: Release
 
 on:
+  workflow_dispatch:
   release:
     types: [created]
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -28,15 +28,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
-
-      - name: Cache dependencies
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.platform.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build binary
         uses: houseabsolute/actions-rust-cross@v0
