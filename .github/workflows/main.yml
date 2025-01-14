@@ -28,28 +28,28 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
+      - name: Set up NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+
       - name: Install Rust and Android targets
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.platform.target }}
 
-      - name: Set up Android NDK
-        uses: android-actions/setup-ndk@v2
-        with:
-          ndk-version: r25c
-
       - name: Build for Android
         run: |
-          export TARGET_AR=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
-          export TARGET_CC=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.platform.target }}-clang
+          export TARGET_AR=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          export TARGET_CC=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.platform.target }}-clang
           cargo build --release --target ${{ matrix.platform.target }}
 
       - name: Rename binary
         run: mv target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }} ./axs-${{ matrix.platform.os_name }}
 
-  # Tests for all platforms
+  # Tests for Unix-like systems
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -61,8 +61,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install dependencies for musl (only if needed)
-        if: ${{ matrix.musl == 'true' }}
+      - name: Install dependencies for musl (if needed)
+        if: ${{ matrix.musl == 'true' && matrix.os == 'ubuntu-latest' }}
         run: sudo apt-get install clang-11 musl-tools
 
       - name: Run tests
