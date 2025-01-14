@@ -19,8 +19,7 @@ jobs:
           - os_name: Android-armv7
             target: armv7-linux-androideabi
             bin: axs-android-armv7
-        toolchain:
-          - stable
+        toolchain: [stable]
     steps:
       - uses: actions/checkout@v3
 
