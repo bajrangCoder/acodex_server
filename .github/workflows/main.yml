@@ -1,18 +1,16 @@
-name: CI Pipeline
-
+name: build and release
 on:
-  push:
-    branches: [main]
-  pull_request: {}
-
-env:
-  RUST_BACKTRACE: 1
-
+  workflow_dispatch:
+  release:
+    types: [created]
+permissions:
+  contents: write
 jobs:
-  # Build for Android platforms
-  build-android:
-    runs-on: ubuntu-latest
+  build:
+    name: ${{ matrix.platform.os_name }}
+    runs-on: ubuntu-20.04
     strategy:
+      fail-fast: false
       matrix:
         platform:
           - os_name: Android-aarch64
@@ -20,58 +18,31 @@ jobs:
             bin: axs-android-arm64
           - os_name: Android-armv7
             target: armv7-linux-androideabi
-            bin: axs-android-arm
-          - os_name: Android-x86_64
-            target: x86_64-linux-android
-            bin: axs-android-x64
+            bin: axs-android-armv7
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-      - name: Set up NDK
-        uses: nttld/setup-ndk@v1
+      - name: Build binary
+        uses: houseabsolute/actions-rust-cross@v0
         with:
-          ndk-version: r26d
-
-      - name: Install Rust and Android targets
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.platform.target }}
-
-      - name: Build for Android
-        run: |
-          export TARGET_AR=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
-          export TARGET_CC=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.platform.target }}-clang
-          cargo build --release --target ${{ matrix.platform.target }}
+          command: "build"
+          args: "--release"
+          target: ${{ matrix.platform.target }}
+          toolchain: ${{ matrix.toolchain }}
+          strip: true
 
       - name: Rename binary
-        run: mv target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }} ./axs-${{ matrix.platform.os_name }}
+        run: mv target/${{ matrix.platform.target }}/release/axs target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }}
 
-  # Tests for Unix-like systems
-  test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        musl: [true, false]
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - name: Generate SHA-256
+        run: shasum -a 256 target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }} | cut -d ' ' -f 1 > target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }}.sha256
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install dependencies for musl (if needed)
-        if: ${{ matrix.musl == 'true' && matrix.os == 'ubuntu-latest' }}
-        run: sudo apt-get install clang-11 musl-tools
-
-      - name: Run tests
-        run: |
-          if [ "${{ matrix.musl }}" == "true" ]; then
-            TARGET_CC=clang-11 TARGET_AR=llvm-ar-11 cargo test --target x86_64-unknown-linux-musl;
-          else
-            cargo test;
-          fi
+      - name: Release binary and checksum
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }}
+            target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }}.sha256
 
   # Linting job
   lint:
