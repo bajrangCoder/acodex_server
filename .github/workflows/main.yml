@@ -30,6 +30,7 @@ jobs:
           command: "build"
           args: "--release"
           target: ${{ matrix.platform.target }}
+          toolchain: ${{ matrix.toolchain }}
           strip: true
 
       - name: Rename binary
