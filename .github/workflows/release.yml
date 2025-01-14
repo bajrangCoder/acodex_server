@@ -3,7 +3,7 @@ name: Release
 on:
   workflow_dispatch:
   release:
-    types: [created]
+    types: [created, published]
 
 permissions:
   contents: write
@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.platform.os_name }}
-    runs-on: ubuntu-latest-arm
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
