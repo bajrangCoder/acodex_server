@@ -30,17 +30,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libunwind-dev gcc-aarch64-linux-gnu
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross.git --branch main
 
-      - name: Build binary
-        uses: houseabsolute/actions-rust-cross@v0
-        with:
-          command: build
-          target: ${{ matrix.platform.target }}
-          toolchain: ${{ matrix.toolchain }}
-          args: "--release"
-          strip: true
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.platform.target }}
+
+      - name: Build binary with cross
+        run: cross build --release --target ${{ matrix.platform.target }}
 
       - name: Rename binary
         run: mv target/${{ matrix.platform.target }}/release/axs target/${{ matrix.platform.target }}/release/${{ matrix.platform.binary_name }}
