@@ -19,7 +19,8 @@ jobs:
           - os_name: Android-armv7
             target: armv7-linux-androideabi
             bin: axs-android-armv7
-        toolchain: [stable]
+        toolchain:
+          - stable
     steps:
       - uses: actions/checkout@v3
 
@@ -27,9 +28,9 @@ jobs:
         uses: houseabsolute/actions-rust-cross@v0
         with:
           command: "build"
-          args: "--release"
           target: ${{ matrix.platform.target }}
           toolchain: ${{ matrix.toolchain }}
+          args: "--release"
           strip: true
 
       - name: Rename binary
