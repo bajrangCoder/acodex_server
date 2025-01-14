@@ -40,8 +40,8 @@ jobs:
 
       - name: Build for Android
         run: |
-          export CARGO_TARGET_${{ matrix.platform.target | upper | replace("-", "_") }}_AR=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
-          export CARGO_TARGET_${{ matrix.platform.target | upper | replace("-", "_") }}_CC=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.platform.target }}-clang
+          export TARGET_AR=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          export TARGET_CC=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.platform.target }}-clang
           cargo build --release --target ${{ matrix.platform.target }}
 
       - name: Rename binary
