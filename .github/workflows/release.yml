@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform.os_name }}
+    runs-on: ubuntu-latest-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os_name: Android-aarch64
+            target: aarch64-linux-android
+            binary_name: axs-android-arm64
+          - os_name: Android-armv7
+            target: armv7-linux-androideabi
+            binary_name: axs-android-armv7
+        toolchain:
+          - stable
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.platform.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build binary
+        uses: houseabsolute/actions-rust-cross@v0
+        with:
+          command: build
+          target: ${{ matrix.platform.target }}
+          toolchain: ${{ matrix.toolchain }}
+          args: "--release"
+          strip: true
+
+      - name: Rename binary
+        run: mv target/${{ matrix.platform.target }}/release/axs target/${{ matrix.platform.target }}/release/${{ matrix.platform.binary_name }}
+
+      - name: Generate SHA-256
+        run: |
+          cd target/${{ matrix.platform.target }}/release
+          sha256sum ${{ matrix.platform.binary_name }} > ${{ matrix.platform.binary_name }}.sha256
+
+      - name: Upload artifacts
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            target/${{ matrix.platform.target }}/release/${{ matrix.platform.binary_name }}
+            target/${{ matrix.platform.target }}/release/${{ matrix.platform.binary_name }}.sha256
