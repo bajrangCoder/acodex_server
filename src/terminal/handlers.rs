@@ -294,7 +294,7 @@ pub async fn terminate_terminal(
 }
 
 pub async fn execute_command(Json(options): Json<ExecuteCommandOption>) -> impl IntoResponse {
-    let cwd = options.cwd.or(options.u_cwd).unwrap();
+    let cwd = options.cwd.or(options.u_cwd).unwrap_or("".to_string());
 
     tracing::info!(
         command = %options.command,
