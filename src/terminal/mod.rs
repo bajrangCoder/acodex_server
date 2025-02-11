@@ -36,9 +36,9 @@ pub async fn start_server(host: Ipv4Addr, port: u16) {
 
     let app = Router::new()
         .route("/terminals", post(create_terminal))
-        .route("/terminals/:pid/resize", post(resize_terminal))
-        .route("/terminals/:pid", get(terminal_websocket))
-        .route("/terminals/:pid/terminate", post(terminate_terminal))
+        .route("/terminals/{pid}/resize", post(resize_terminal))
+        .route("/terminals/{pid}", get(terminal_websocket))
+        .route("/terminals/{pid}/terminate", post(terminate_terminal))
         .route("/execute-command", post(execute_command))
         .with_state(sessions)
         .layer(cors)
