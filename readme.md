@@ -5,10 +5,10 @@
 ## Features
 
 - Lightweight
-- Independent (serves as a binary)
 - Secure
 - fast
 - uses system pty
+- automatic update checking
 
 ## Installation
 
@@ -18,9 +18,35 @@ To install `axs` on your system, simply use the following command:
 curl -L https://raw.githubusercontent.com/bajrangCoder/acodex_server/main/install.sh | bash
 ```
 
+## Update  
+
+`axs` will automatically notify you whenever a new update is available. With a simple command:  
+
+```sh
+axs update
+```  
+
+you can easily update it without any hassle.  
+
+> [!NOTE]
+> This feature is available from `v0.2.0` onwards. For older versions, please use the installation script to update.
+
 ### Example Usage
+
 ```bash
-axs --help
+$ axs --help
+CLI/Server backend for AcodeX Acode plugin
+
+Usage: axs [OPTIONS] [COMMAND]
+
+Commands:
+  update  Update axs server
+  help    Print this message or the help of the given subcommand(s)
+Options:
+  -p, --port <PORT>  Port to start the server [default: 8767]
+  -i, --ip           Start the server on local network (ip)
+  -h, --help         Print help
+  -V, --version      Print version
 ```
 
 > [!NOTE]

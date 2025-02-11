@@ -18,7 +18,6 @@ use handlers::*;
 
 pub type Sessions = Arc<Mutex<HashMap<u32, TerminalSession>>>;
 
-#[tokio::main]
 pub async fn start_server(host: Ipv4Addr, port: u16) {
     tracing_subscriber::registry()
         .with(
