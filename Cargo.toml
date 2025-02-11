@@ -5,14 +5,17 @@ edition = "2021"
 
 
 [dependencies]
-axum = { version = "0.7.9", features = ["ws"] }
+axum = { version = "0.8.1", features = ["ws"] }
 clap = { version = "4.4.18", features = ["derive"] }
-colored = "2.1.0"
+colored = "3.0.0"
 futures = "0.3.31"
-pnet = "0.34.0"
+pnet = "0.35.0"
 portable-pty = { git = "https://github.com/wez/wezterm", package = "portable-pty", rev = "1e941fca5c17155b5f64a74221a396ef12ef71d0" }
 regex = "1.11.1"
-reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.12", default-features = false, features = [
+  "json",
+  "rustls-tls",
+] }
 semver = "1.0.25"
 serde = { version = "1.0.215", features = ["derive"] }
 serde_json = "1.0.133"

@@ -2,6 +2,7 @@ use super::buffer::CircularBuffer;
 use super::types::*;
 use crate::utils::parse_u16;
 use axum::{
+    body::Bytes,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, State,
@@ -155,10 +156,9 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
 
         // Send initial buffer contents
         let buffer_guard = buffer.lock().await;
-        if let Ok(initial_content) = String::from_utf8(buffer_guard.get_contents()) {
-            if !initial_content.is_empty() {
-                let _ = sender.send(Message::Text(initial_content)).await;
-            }
+        let contents = buffer_guard.get_contents();
+        if !contents.is_empty() {
+            let _ = sender.send(Message::Binary(contents)).await;
         }
         drop(buffer_guard);
 
@@ -180,15 +180,16 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
 
                         let data = read_buffer[..n].to_vec();
 
-                        if let Ok(text) = String::from_utf8(data.clone()) {
-                            let rt = tokio::runtime::Handle::current();
-                            if !rt.block_on(async {
-                                let mut buffer_guard = buffer.lock().await;
-                                buffer_guard.write(&data);
-                                sender.send(Message::Text(text)).await.is_ok()
-                            }) {
-                                break;
-                            }
+                        let rt = tokio::runtime::Handle::current();
+                        if !rt.block_on(async {
+                            let mut buffer_guard = buffer.lock().await;
+                            buffer_guard.write(&data);
+                            sender
+                                .send(Message::Binary(Bytes::from(data.clone())))
+                                .await
+                                .is_ok()
+                        }) {
+                            break;
                         }
                     }
                 })
@@ -215,14 +216,14 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
                 });
 
                 while let Some(Ok(message)) = receiver.next().await {
-                    let data = match message {
-                        Message::Text(text) => text.into_bytes(),
+                    let data: axum::body::Bytes = match message {
+                        Message::Text(text) => Bytes::from(text),
                         Message::Binary(data) => data,
                         Message::Close(_) => break,
                         _ => continue,
                     };
 
-                    if tx_clone.send(data).is_err() {
+                    if tx_clone.send(data.to_vec()).is_err() {
                         break;
                     }
                 }
