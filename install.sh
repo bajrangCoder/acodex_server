@@ -3,10 +3,10 @@
 # detect architecture
 detect_arch() {
     case $(uname -m) in
-        armv7l)
+        armv7l | armv8l)
             echo "android-armv7"
             ;;
-        aarch64 | armv8l)
+        aarch64)
             echo "android-arm64"
             ;;
         *)
