@@ -1,0 +1,51 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform.os_name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os_name: Android-aarch64
+            target: aarch64-linux-android
+            binary_name: axs-android-arm64
+          - os_name: Android-armv7
+            target: armv7-linux-androideabi
+            binary_name: axs-android-armv7
+        toolchain:
+          - stable
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross.git --branch main
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.platform.target }}
+
+      - name: Build binary with cross
+        run: cross build --release --target ${{ matrix.platform.target }}
+
+      - name: Rename binary
+        run: mv target/${{ matrix.platform.target }}/release/axs target/${{ matrix.platform.target }}/release/${{ matrix.platform.binary_name }}
+
+      - name: Generate SHA-256
+        run: |
+          cd target/${{ matrix.platform.target }}/release
+          sha256sum ${{ matrix.platform.binary_name }} > ${{ matrix.platform.binary_name }}.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform.binary_name }}
+          path: |
+            target/${{ matrix.platform.target }}/release/${{ matrix.platform.binary_name }}
+            target/${{ matrix.platform.target }}/release/${{ matrix.platform.binary_name }}.sha256
