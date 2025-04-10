@@ -43,7 +43,7 @@ pub async fn create_terminal(
 
     let pty_system = native_pty_system();
 
-    let shell = &std::env::var("SHELL").unwrap_or_else(|_| String::from("bash"));
+    let shell = String::from("login");
 
     let size = PtySize {
         rows,
@@ -303,7 +303,7 @@ pub async fn execute_command(Json(options): Json<ExecuteCommandOption>) -> impl 
         "Executing command"
     );
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| String::from("bash"));
+    let shell = String::from("login");
     let cwd = if cwd.is_empty() {
         std::env::var("HOME")
             .map(PathBuf::from)
