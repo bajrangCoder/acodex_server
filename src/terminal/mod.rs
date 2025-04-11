@@ -7,8 +7,8 @@ use axum::{
     Router,
 };
 
-use std::net::Ipv4Addr;
 use std::{collections::HashMap, sync::Arc};
+use std::{io::ErrorKind, net::Ipv4Addr};
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
@@ -49,7 +49,20 @@ pub async fn start_server(host: Ipv4Addr, port: u16) {
 
     let addr: std::net::SocketAddr = (host, port).into();
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    tracing::info!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            tracing::info!("listening on {}", listener.local_addr().unwrap());
+
+            if let Err(e) = axum::serve(listener, app).await {
+                tracing::error!("Server error: {}", e);
+            }
+        }
+        Err(e) => {
+            if e.kind() == ErrorKind::AddrInUse {
+                tracing::error!("Port is already in use please kill all other instances of axs server or stop any other process or app that maybe be using port {}", port);
+            } else {
+                tracing::error!("Failed to bind: {}", e);
+            }
+        }
+    }
 }
