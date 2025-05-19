@@ -9,6 +9,9 @@ detect_arch() {
         aarch64)
             echo "android-arm64"
             ;;
+        x86_64)
+            echo "android-x86_64"
+            ;;
         *)
             echo "Unsupported architecture. Please create an issue on GitHub, and we will consider providing a binary for your architecture."
             exit 1
@@ -27,7 +30,7 @@ download_binary() {
     # Download the binary
     echo "Downloading $FILE_NAME for $ARCH architecture..."
     if ! curl --progress-bar --fail -L "$DOWNLOAD_URL" -o "$FILE_NAME"; then
-        echo "Failed to download the binary!"
+        echo "Failed to download the binary! Please check the URL and your connection: $DOWNLOAD_URL"
         exit 1
     fi
 
@@ -37,6 +40,7 @@ download_binary() {
     chmod +x "$PREFIX/bin/axs"
 
     echo "Binary downloaded and installed as 'axs'. You can now use the 'axs' command!"
+    echo "Make sure '$PREFIX/bin' is in your PATH."
 }
 
 download_binary
