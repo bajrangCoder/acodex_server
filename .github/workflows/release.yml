@@ -23,6 +23,9 @@ jobs:
           - os_name: Android-armv7
             target: armv7-linux-androideabi
             binary_name: axs-android-armv7
+          - os_name: Android-x86_64
+            target: x86_64-linux-android
+            binary_name: axs-android-x86_64
         toolchain:
           - stable
 
