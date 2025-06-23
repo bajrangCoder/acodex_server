@@ -39,6 +39,9 @@ download_binary() {
     mv "$FILE_NAME" "$PREFIX/bin/axs"
     chmod +x "$PREFIX/bin/axs"
 
+    # Create a symlink acodeX-server pointing to axs
+    ln -sf "$PREFIX/bin/axs" "$PREFIX/bin/acodeX-server"
+
     echo "Binary downloaded and installed as 'axs'. You can now use the 'axs' command!"
     echo "Make sure '$PREFIX/bin' is in your PATH."
 }

@@ -1,6 +1,6 @@
 [package]
 name = "axs"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 
 
@@ -13,8 +13,8 @@ pnet = "0.35.0"
 portable-pty = { git = "https://github.com/wez/wezterm", package = "portable-pty", rev = "1e941fca5c17155b5f64a74221a396ef12ef71d0" }
 regex = "1.11.1"
 reqwest = { version = "0.12.12", default-features = false, features = [
-  "json",
-  "rustls-tls",
+    "json",
+    "rustls-tls",
 ] }
 semver = "1.0.25"
 serde = { version = "1.0.215", features = ["derive"] }
