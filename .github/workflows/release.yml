@@ -26,6 +26,9 @@ jobs:
           - os_name: Android-x86_64
             target: x86_64-linux-android
             binary_name: axs-android-x86_64
+          - os_name: aarch64-unknown-linux-musl
+            target: aarch64-unknown-linux-musl
+            binary_name: axs-aarch64-unknown-linux-musl
         toolchain:
           - stable
 
