@@ -26,12 +26,15 @@ jobs:
           - os_name: Android-x86_64
             target: x86_64-linux-android
             binary_name: axs-android-x86_64
-          - os_name: aarch64-unknown-linux-musl
+          - os_name: MuslAndroid-aarch64
             target: aarch64-unknown-linux-musl
-            binary_name: axs-aarch64-unknown-linux-musl
-        toolchain:
-          - stable
-
+            binary_name: axs-musl-android-arm64
+          - os_name: MuslAndroid-armv7
+            target: armv7-unknown-linux-musleabihf
+            binary_name: axs-musl-android-armv7
+          - os_name: MuslAndroid-x86_64
+            target: x86_64-unknown-linux-musl
+            binary_name: axs-musl-android-x86_64
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
