@@ -11,7 +11,7 @@ use axum::{
     Json,
 };
 use futures::{SinkExt, StreamExt};
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use regex::Regex;
 use std::io::Write;
 use std::time::SystemTime;
@@ -27,6 +27,7 @@ use tokio::task::spawn_blocking;
 pub struct TerminalSession {
     pub master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     pub child_killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+    pub child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     pub reader: Arc<Mutex<Box<dyn Read + Send>>>,
     pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub buffer: Arc<Mutex<CircularBuffer>>,
@@ -69,6 +70,7 @@ pub async fn create_terminal(
                     let session = TerminalSession {
                         master,
                         child_killer,
+                        child: Arc::new(Mutex::new(child)),
                         reader,
                         writer,
                         buffer: Arc::new(Mutex::new(CircularBuffer::new(MAX_BUFFER_SIZE))),
@@ -152,6 +154,7 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
         let reader = session.reader.clone();
         let writer = session.writer.clone();
         let buffer = session.buffer.clone();
+        let child = session.child.clone();
         drop(session_lock);
 
         // Send initial buffer contents
@@ -162,41 +165,104 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
         }
         drop(buffer_guard);
 
+        // Create channels for communication
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+        let (exit_tx, mut exit_rx) = tokio::sync::mpsc::channel::<portable_pty::ExitStatus>(1);
+
         let pty_to_ws = {
-            let buffer = buffer.clone();
             let reader = reader.clone();
+            let child = child.clone();
 
             tokio::spawn(async move {
-                spawn_blocking(move || {
-                    let mut read_buffer = [0u8; 1024];
-                    loop {
-                        let n = {
-                            let mut reader_guard = reader.blocking_lock();
-                            match reader_guard.read(&mut read_buffer) {
-                                Ok(n) if n > 0 => n,
-                                _ => break,
+                // Spawn read task
+                let read_task = spawn_blocking({
+                    let reader = reader.clone();
+                    let output_tx = output_tx.clone();
+                    move || {
+                        let mut read_buffer = [0u8; 1024];
+                        loop {
+                            let n = {
+                                let mut reader_guard = reader.blocking_lock();
+                                match reader_guard.read(&mut read_buffer) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => break,
+                                }
+                            };
+
+                            let data = read_buffer[..n].to_vec();
+                            if output_tx.blocking_send(data).is_err() {
+                                break;
                             }
-                        };
+                        }
+                    }
+                });
 
-                        let data = read_buffer[..n].to_vec();
+                // Spawn wait task
+                let wait_task = spawn_blocking({
+                    let child = child.clone();
+                    let exit_tx = exit_tx.clone();
+                    move || {
+                        let mut child_guard = child.blocking_lock();
+                        if let Ok(exit_status) = child_guard.wait() {
+                            let _ = exit_tx.blocking_send(exit_status);
+                        }
+                    }
+                });
 
-                        let rt = tokio::runtime::Handle::current();
-                        if !rt.block_on(async {
+                // Wait for tasks to complete
+                let _ = tokio::join!(read_task, wait_task);
+            })
+        };
+
+        // Handle output and exit events
+        let output_handler = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    data = output_rx.recv() => {
+                        if let Some(data) = data {
                             let mut buffer_guard = buffer.lock().await;
                             buffer_guard.write(&data);
-                            sender
-                                .send(Message::Binary(Bytes::from(data.clone())))
-                                .await
-                                .is_ok()
-                        }) {
+                            drop(buffer_guard);
+
+                            if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
+                                break;
+                            }
+                        } else {
                             break;
                         }
                     }
-                })
-                .await
-                .ok();
-            })
-        };
+                    exit_status = exit_rx.recv() => {
+                        if let Some(exit_status) = exit_status {
+                            let exit_message = if exit_status.success() {
+                                ProcessExitMessage {
+                                    exit_code: Some(0),
+                                    signal: None,
+                                    message: "Process exited successfully".to_string(),
+                                }
+                            } else {
+                                ProcessExitMessage {
+                                    exit_code: Some(1),
+                                    signal: None,
+                                    message: "Process exited with non-zero status".to_string(),
+                                }
+                            };
+
+                            // Send exit message to WebSocket
+                            let exit_json = serde_json::to_string(&exit_message).unwrap_or_else(|_|
+                                "{\"exit_code\":1,\"signal\":null,\"message\":\"Process exited\"}".to_string()
+                            );
+
+                            let _ = sender.send(Message::Text(format!("{{\"type\":\"exit\",\"data\":{}}}", exit_json).into())).await;
+
+                            // Remove session from sessions map
+                            let mut sessions_guard = sessions.lock().await;
+                            sessions_guard.remove(&pid);
+                            break;
+                        }
+                    }
+                }
+            }
+        });
 
         // Handle WebSocket input to PTY
         let ws_to_pty = {
@@ -234,10 +300,13 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
             })
         };
 
-        // Wait for either task to complete
+        // Wait for any task to complete
         tokio::select! {
             _ = pty_to_ws => {
                 tracing::info!("PTY to WebSocket task completed for terminal {}", pid);
+            }
+            _ = output_handler => {
+                tracing::info!("Output handler completed for terminal {}", pid);
             }
             _ = ws_to_pty => {
                 tracing::info!("WebSocket to PTY task completed for terminal {}", pid);

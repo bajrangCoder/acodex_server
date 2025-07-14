@@ -29,4 +29,11 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ProcessExitMessage {
+    pub exit_code: Option<i32>,
+    pub signal: Option<String>,
+    pub message: String,
+}
+
 pub type Sessions = Arc<Mutex<HashMap<u32, TerminalSession>>>;
