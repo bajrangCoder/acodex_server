@@ -1,4 +1,5 @@
 use super::buffer::CircularBuffer;
+use super::get_default_command;
 use super::types::*;
 use crate::utils::parse_u16;
 use axum::{
@@ -44,7 +45,18 @@ pub async fn create_terminal(
 
     let pty_system = native_pty_system();
 
-    let shell = String::from("login");
+    // Determine the command to run for the interactive PTY
+    let mut program = String::from("login");
+    let mut args: Vec<String> = Vec::new();
+    if let Some(cmd) = get_default_command() {
+        let parts: Vec<String> = cmd.split_whitespace().map(|s| s.to_string()).collect();
+        if !parts.is_empty() {
+            program = parts[0].clone();
+            if parts.len() > 1 {
+                args = parts[1..].to_vec();
+            }
+        }
+    }
 
     let size = PtySize {
         rows,
@@ -55,7 +67,11 @@ pub async fn create_terminal(
 
     match pty_system.openpty(size) {
         Ok(pair) => {
-            let cmd = CommandBuilder::new(shell);
+            let mut cmd = CommandBuilder::new(program);
+            if !args.is_empty() {
+                let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                cmd.args(arg_refs);
+            }
             match pair.slave.spawn_command(cmd) {
                 Ok(child) => {
                     let pid = child.process_id().unwrap_or(0);
@@ -83,7 +99,7 @@ pub async fn create_terminal(
                 Err(e) => {
                     tracing::error!("Failed to spawn command: {}", e);
                     Json(ErrorResponse {
-                        error: format!("Failed to spawn command: {}", e),
+                        error: format!("Failed to spawn command: {e}"),
                     })
                     .into_response()
                 }
@@ -92,7 +108,7 @@ pub async fn create_terminal(
         Err(e) => {
             tracing::error!("Failed to open PTY: {}", e);
             Json(ErrorResponse {
-                error: format!("Failed to open PTY: {}", e),
+                error: format!("Failed to open PTY: {e}"),
             })
             .into_response()
         }
@@ -119,7 +135,7 @@ pub async fn resize_terminal(
         match session.master.lock().await.resize(size) {
             Ok(_) => Json(serde_json::json!({"success": true})).into_response(),
             Err(e) => Json(ErrorResponse {
-                error: format!("Failed to resize: {}", e),
+                error: format!("Failed to resize: {e}"),
             })
             .into_response(),
         }
@@ -252,7 +268,7 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
                                 "{\"exit_code\":1,\"signal\":null,\"message\":\"Process exited\"}".to_string()
                             );
 
-                            let _ = sender.send(Message::Text(format!("{{\"type\":\"exit\",\"data\":{}}}", exit_json).into())).await;
+                            let _ = sender.send(Message::Text(format!("{{\"type\":\"exit\",\"data\":{exit_json}}}").into())).await;
 
                             // Remove session from sessions map
                             let mut sessions_guard = sessions.lock().await;
@@ -349,7 +365,7 @@ pub async fn terminate_terminal(
             Err(e) => {
                 tracing::error!("Failed to terminate terminal {}: {}", pid, e);
                 Json(ErrorResponse {
-                    error: format!("Failed to terminate terminal {}: {}", pid, e),
+                    error: format!("Failed to terminate terminal {pid}: {e}"),
                 })
                 .into_response()
             }
@@ -372,7 +388,8 @@ pub async fn execute_command(Json(options): Json<ExecuteCommandOption>) -> impl 
         "Executing command"
     );
 
-    let shell = String::from("login");
+    // Use a POSIX shell to execute non-interactive commands
+    let shell = String::from("sh");
     let cwd = if cwd.is_empty() {
         std::env::var("HOME")
             .map(PathBuf::from)

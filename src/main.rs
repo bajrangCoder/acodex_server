@@ -5,6 +5,7 @@ mod utils;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::net::Ipv4Addr;
+use terminal::set_default_command;
 use terminal::start_server;
 use updates::UpdateChecker;
 use utils::get_ip_address;
@@ -21,6 +22,9 @@ struct Cli {
     /// Start the server on local network (ip)
     #[arg(short, long)]
     ip: bool,
+    /// Custom command or shell for interactive PTY (e.g. "/usr/bin/bash")
+    #[arg(short = 'c', long = "command")]
+    command_override: Option<String>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -49,7 +53,7 @@ async fn check_updates_in_background() {
         Err(e) => eprintln!(
             "{} {}",
             "⚠️".yellow(),
-            format!("Failed to check for updates: {}", e).red()
+            format!("Failed to check for updates: {e}").red()
         ),
         _ => {}
     }
@@ -117,6 +121,11 @@ async fn main() {
         }
         None => {
             tokio::task::spawn(check_updates_in_background());
+
+            if let Some(cmd) = cli.command_override {
+                // Set custom default command for interactive terminals
+                set_default_command(cmd);
+            }
 
             let ip = if cli.ip {
                 get_ip_address().unwrap_or_else(|| {

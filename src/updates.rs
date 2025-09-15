@@ -66,7 +66,7 @@ impl UpdateChecker {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            let content = format!("{},{}", now, version);
+            let content = format!("{now},{version}");
             fs::write(cache_path, content).await?;
         }
         Ok(())
@@ -148,7 +148,7 @@ impl UpdateChecker {
         let asset = release
             .assets
             .iter()
-            .find(|a| a.name == format!("axs-{}", arch))
+            .find(|a| a.name == format!("axs-{arch}"))
             .ok_or("No matching binary found")?;
 
         // Download binary

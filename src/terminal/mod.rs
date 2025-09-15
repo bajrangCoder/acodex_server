@@ -7,6 +7,7 @@ use axum::{
     Router,
 };
 
+use std::sync::OnceLock;
 use std::{collections::HashMap, sync::Arc};
 use std::{io::ErrorKind, net::Ipv4Addr};
 use tokio::sync::Mutex;
@@ -17,6 +18,16 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use handlers::*;
 
 pub type Sessions = Arc<Mutex<HashMap<u32, TerminalSession>>>;
+
+static DEFAULT_COMMAND: OnceLock<String> = OnceLock::new();
+
+pub fn set_default_command(cmd: String) {
+    let _ = DEFAULT_COMMAND.set(cmd);
+}
+
+pub fn get_default_command() -> Option<&'static str> {
+    DEFAULT_COMMAND.get().map(|s| s.as_str())
+}
 
 pub async fn start_server(host: Ipv4Addr, port: u16) {
     tracing_subscriber::registry()
