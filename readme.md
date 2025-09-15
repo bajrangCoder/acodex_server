@@ -1,6 +1,6 @@
 # acodex_server
 
-`acodex_server` is a Rust-based backend/server for the `Acodex plugin`. It provides a **lightweight**, **independent**, **secure**, and **fast** solution.
+`acodex_server` is a Rust-based backend/server for serving shell over socket. It provides a **lightweight**, **independent**, **secure**, and **fast** solution.
 
 ## Features
 
@@ -35,18 +35,21 @@ you can easily update it without any hassle.
 
 ```bash
 $ axs --help
-CLI/Server backend for AcodeX Acode plugin
+CLI/Server backend to serve pty over socket
 
 Usage: axs [OPTIONS] [COMMAND]
 
 Commands:
   update  Update axs server
   help    Print this message or the help of the given subcommand(s)
+
 Options:
-  -p, --port <PORT>  Port to start the server [default: 8767]
-  -i, --ip           Start the server on local network (ip)
-  -h, --help         Print help
-  -V, --version      Print version
+  -p, --port <PORT>                 Port to start the server [default: 8767]
+  -i, --ip                          Start the server on local network (ip)
+  -c, --command <COMMAND_OVERRIDE>  Custom command or shell for interactive PTY (e.g. "/usr/bin/bash")
+      --allow-any-origin            Allow all origins for CORS (dangerous). By default only https://localhost is allowed
+  -h, --help                        Print help
+  -V, --version                     Print version
 ```
 
 > [!NOTE]
