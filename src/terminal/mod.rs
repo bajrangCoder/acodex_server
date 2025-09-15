@@ -7,6 +7,7 @@ use axum::{
     Router,
 };
 
+use axum::http::HeaderValue;
 use std::sync::OnceLock;
 use std::{collections::HashMap, sync::Arc};
 use std::{io::ErrorKind, net::Ipv4Addr};
@@ -29,7 +30,7 @@ pub fn get_default_command() -> Option<&'static str> {
     DEFAULT_COMMAND.get().map(|s| s.as_str())
 }
 
-pub async fn start_server(host: Ipv4Addr, port: u16) {
+pub async fn start_server(host: Ipv4Addr, port: u16, allow_any_origin: bool) {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -40,10 +41,21 @@ pub async fn start_server(host: Ipv4Addr, port: u16) {
         .init();
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = if allow_any_origin {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    } else {
+        // Only allow your Cordova app origin by default
+        let localhost = "https://localhost"
+            .parse::<HeaderValue>()
+            .expect("valid origin");
+        CorsLayer::new()
+            .allow_origin(localhost)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    };
 
     let app = Router::new()
         .route("/", get(|| async { "Rust based AcodeX server" }))

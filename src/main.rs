@@ -25,6 +25,9 @@ struct Cli {
     /// Custom command or shell for interactive PTY (e.g. "/usr/bin/bash")
     #[arg(short = 'c', long = "command")]
     command_override: Option<String>,
+    /// Allow all origins for CORS (dangerous). By default only https://localhost is allowed.
+    #[arg(long = "allow-any-origin")]
+    allow_any_origin: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -141,7 +144,7 @@ async fn main() {
                 LOCAL_IP
             };
 
-            start_server(ip, cli.port).await;
+            start_server(ip, cli.port, cli.allow_any_origin).await;
         }
     }
 }
