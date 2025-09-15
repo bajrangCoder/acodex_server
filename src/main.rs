@@ -14,7 +14,7 @@ const DEFAULT_PORT: u16 = 8767;
 const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 
 #[derive(Parser)]
-#[command(name = "acodex_server(axs)",version, author = "Raunak Raj <bajrangcoders@gmail.com>", about = "CLI/Server backend for AcodeX Acode plugin", long_about = None)]
+#[command(name = "acodex_server(axs)",version, author = "Raunak Raj <bajrangcoders@gmail.com>", about = "CLI/Server backend to serve pty over socket", long_about = None)]
 struct Cli {
     /// Port to start the server
     #[arg(short, long, default_value_t = DEFAULT_PORT, value_parser = clap::value_parser!(u16).range(1..))]
