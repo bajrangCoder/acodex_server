@@ -7,6 +7,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use futures::{SinkExt, StreamExt};
+use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::process::ExitStatus;
 use std::sync::Arc;
@@ -124,6 +125,12 @@ async fn run_bridge(socket: WebSocket, config: Arc<LspBridgeConfig>) -> Result<(
         .spawn()
         .map_err(|e| format!("Failed to spawn LSP command '{}': {e}", config.program))?;
 
+    tracing::info!(
+        program = %config.program,
+        args = ?config.args,
+        "WebSocket client connected; LSP process spawned",
+    );
+
     let stdout = child
         .stdout
         .take()
@@ -186,19 +193,30 @@ async fn run_bridge(socket: WebSocket, config: Arc<LspBridgeConfig>) -> Result<(
 }
 
 async fn forward_stdout(mut stdout: tokio::process::ChildStdout, tx: mpsc::Sender<Message>) {
-    let mut buffer = vec![0u8; 8192];
+    let mut buf = vec![0u8; 8192];
+    let mut decoder = LspMessageFramer::default();
+
     loop {
-        match stdout.read(&mut buffer).await {
+        match stdout.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
-                if tx
-                    .send(Message::Binary(buffer[..n].to_vec().into()))
-                    .await
-                    .is_err()
-                {
+                if let Err(err) = decoder.push(&buf[..n]) {
+                    tracing::error!(error = %err, "Failed to decode LSP stdout stream");
                     break;
                 }
+
+                while let Some(frame) = decoder.next_message() {
+                    let message = match String::from_utf8(frame.clone()) {
+                        Ok(text) => Message::Text(text.into()),
+                        Err(_) => Message::Binary(frame.into()),
+                    };
+
+                    if tx.send(message).await.is_err() {
+                        return;
+                    }
+                }
             }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(err) => {
                 tracing::error!(error = %err, "Failed to read from LSP stdout");
                 break;
@@ -220,10 +238,18 @@ async fn forward_client_messages(
                     tracing::error!(error = %err, "Failed to write binary frame to LSP");
                     break;
                 }
+                if let Err(err) = stdin.flush().await {
+                    tracing::error!(error = %err, "Failed to flush LSP stdin");
+                    break;
+                }
             }
             Ok(Message::Text(text)) => {
                 if let Err(err) = stdin.write_all(text.as_bytes()).await {
                     tracing::error!(error = %err, "Failed to write text frame to LSP");
+                    break;
+                }
+                if let Err(err) = stdin.flush().await {
+                    tracing::error!(error = %err, "Failed to flush LSP stdin");
                     break;
                 }
             }
@@ -247,6 +273,66 @@ async fn forward_client_messages(
 
     let _ = stdin.shutdown().await;
     let _ = shutdown_tx.send(());
+}
+
+#[derive(Default)]
+struct LspMessageFramer {
+    buffer: Vec<u8>,
+    messages: VecDeque<Vec<u8>>,
+}
+
+impl LspMessageFramer {
+    fn push(&mut self, chunk: &[u8]) -> Result<(), String> {
+        self.buffer.extend_from_slice(chunk);
+
+        loop {
+            let Some(header_end) = find_header_terminator(&self.buffer) else {
+                break;
+            };
+
+            let header = &self.buffer[..header_end];
+            let content_length = parse_content_length(header)?;
+            let frame_len = header_end + 4 + content_length; // include delimiter
+
+            if self.buffer.len() < frame_len {
+                break;
+            }
+
+            let frame = self.buffer.drain(..frame_len).collect::<Vec<u8>>();
+            self.messages.push_back(frame);
+        }
+
+        Ok(())
+    }
+
+    fn next_message(&mut self) -> Option<Vec<u8>> {
+        self.messages.pop_front()
+    }
+}
+
+fn find_header_terminator(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn parse_content_length(header: &[u8]) -> Result<usize, String> {
+    let header_str =
+        std::str::from_utf8(header).map_err(|_| "Invalid UTF-8 in LSP header".to_string())?;
+
+    for line in header_str.split("\r\n") {
+        let mut parts = line.splitn(2, ':');
+        let key = parts.next().map(str::trim);
+        let value = parts.next().map(str::trim);
+
+        if let (Some(key), Some(value)) = (key, value) {
+            if key.eq_ignore_ascii_case("content-length") {
+                return value
+                    .parse::<usize>()
+                    .map_err(|_| format!("Invalid Content-Length header: {value}"));
+            }
+        }
+    }
+
+    Err("Missing Content-Length header".to_string())
 }
 
 async fn forward_stderr(stderr: ChildStderr) -> Result<(), std::io::Error> {
