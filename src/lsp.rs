@@ -244,8 +244,15 @@ async fn forward_client_messages(
                 }
             }
             Ok(Message::Text(text)) => {
-                if let Err(err) = stdin.write_all(text.as_bytes()).await {
-                    tracing::error!(error = %err, "Failed to write text frame to LSP");
+                let body = text.as_bytes();
+                let header = format!("Content-Length: {}\r\n\r\n", body.len());
+
+                if let Err(err) = stdin.write_all(header.as_bytes()).await {
+                    tracing::error!(error = %err, "Failed to send LSP header");
+                    break;
+                }
+                if let Err(err) = stdin.write_all(body).await {
+                    tracing::error!(error = %err, "Failed to write LSP payload");
                     break;
                 }
                 if let Err(err) = stdin.flush().await {
@@ -290,16 +297,18 @@ impl LspMessageFramer {
                 break;
             };
 
-            let header = &self.buffer[..header_end];
-            let content_length = parse_content_length(header)?;
-            let frame_len = header_end + 4 + content_length; // include delimiter
+            let headers = &self.buffer[..header_end];
+            let content_length = parse_content_length(headers)?;
+            let body_start = header_end + 4;
+            let frame_len = body_start + content_length;
 
             if self.buffer.len() < frame_len {
                 break;
             }
 
-            let frame = self.buffer.drain(..frame_len).collect::<Vec<u8>>();
-            self.messages.push_back(frame);
+            let body = self.buffer[body_start..frame_len].to_vec();
+            self.buffer.drain(..frame_len);
+            self.messages.push_back(body);
         }
 
         Ok(())
