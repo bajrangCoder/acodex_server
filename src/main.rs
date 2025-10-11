@@ -1,12 +1,13 @@
+mod lsp;
 mod terminal;
 mod updates;
 mod utils;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use lsp::{start_lsp_server, LspBridgeConfig};
 use std::net::Ipv4Addr;
-use terminal::set_default_command;
-use terminal::start_server;
+use terminal::{set_default_command, start_server};
 use updates::UpdateChecker;
 use utils::get_ip_address;
 
@@ -17,16 +18,16 @@ const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 #[command(name = "acodex_server(axs)",version, author = "Raunak Raj <bajrangcoders@gmail.com>", about = "CLI/Server backend to serve pty over socket", long_about = None)]
 struct Cli {
     /// Port to start the server
-    #[arg(short, long, default_value_t = DEFAULT_PORT, value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(short, long, default_value_t = DEFAULT_PORT, value_parser = clap::value_parser!(u16).range(1..), global = true)]
     port: u16,
     /// Start the server on local network (ip)
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     ip: bool,
     /// Custom command or shell for interactive PTY (e.g. "/usr/bin/bash")
     #[arg(short = 'c', long = "command")]
     command_override: Option<String>,
     /// Allow all origins for CORS (dangerous). By default only https://localhost is allowed.
-    #[arg(long = "allow-any-origin")]
+    #[arg(long = "allow-any-origin", global = true)]
     allow_any_origin: bool,
     #[command(subcommand)]
     command: Option<Commands>,
@@ -36,6 +37,14 @@ struct Cli {
 enum Commands {
     /// Update axs server
     Update,
+    /// Start a WebSocket LSP bridge for a stdio language server
+    Lsp {
+        /// The language server binary to run (e.g. "rust-analyzer")
+        server: String,
+        /// Additional arguments to forward to the language server
+        #[arg(trailing_var_arg = true)]
+        server_args: Vec<String>,
+    },
 }
 
 fn print_update_available(current_version: &str, new_version: &str) {
@@ -66,7 +75,15 @@ async fn check_updates_in_background() {
 async fn main() {
     let cli: Cli = Cli::parse();
 
-    match cli.command {
+    let Cli {
+        port,
+        ip,
+        command_override,
+        allow_any_origin,
+        command,
+    } = cli;
+
+    match command {
         Some(Commands::Update) => {
             println!("{} {}", "⟳".blue().bold(), "Checking for updates...".blue());
 
@@ -122,15 +139,11 @@ async fn main() {
                 }
             }
         }
-        None => {
-            tokio::task::spawn(check_updates_in_background());
-
-            if let Some(cmd) = cli.command_override {
-                // Set custom default command for interactive terminals
-                set_default_command(cmd);
-            }
-
-            let ip = if cli.ip {
+        Some(Commands::Lsp {
+            server,
+            server_args,
+        }) => {
+            let host = if ip {
                 get_ip_address().unwrap_or_else(|| {
                     println!(
                         "{} localhost.",
@@ -144,7 +157,36 @@ async fn main() {
                 LOCAL_IP
             };
 
-            start_server(ip, cli.port, cli.allow_any_origin).await;
+            let config = LspBridgeConfig {
+                program: server,
+                args: server_args,
+            };
+
+            start_lsp_server(host, port, allow_any_origin, config).await;
+        }
+        None => {
+            tokio::task::spawn(check_updates_in_background());
+
+            if let Some(cmd) = command_override {
+                // Set custom default command for interactive terminals
+                set_default_command(cmd);
+            }
+
+            let ip = if ip {
+                get_ip_address().unwrap_or_else(|| {
+                    println!(
+                        "{} localhost.",
+                        "Error: IP address not found. Starting server on"
+                            .red()
+                            .bold()
+                    );
+                    LOCAL_IP
+                })
+            } else {
+                LOCAL_IP
+            };
+
+            start_server(ip, port, allow_any_origin).await;
         }
     }
 }
