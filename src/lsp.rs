@@ -1,20 +1,28 @@
-use axum::extract::{
-    ws::{Message, WebSocket, WebSocketUpgrade},
-    State,
-};
+//! LSP WebSocket Proxy
+
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderValue;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
+use bytes::{Buf, BufMut, BytesMut};
 use futures::{SinkExt, StreamExt};
-use std::collections::VecDeque;
+use nom::{
+    branch::alt,
+    bytes::streaming::{is_not, tag, take_until},
+    character::streaming::{char, crlf, digit1, space0},
+    combinator::{map, map_res, opt},
+    multi::length_data,
+    sequence::{delimited, terminated, tuple},
+    IResult,
+};
+use std::io::Write;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::Stdio;
+use std::str;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
-
+use tokio::process::Command;
+use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -25,48 +33,9 @@ pub struct LspBridgeConfig {
     pub args: Vec<String>,
 }
 
-/// Unique client identifier
-type ClientId = u64;
-
-/// Message to be sent to the LSP stdin
-struct LspInputMessage {
-    /// The raw bytes to write (with Content-Length header already included)
-    data: Vec<u8>,
-}
-
-/// Shared state for the LSP process
-struct SharedLspProcess {
-    /// Channel to send messages to LSP stdin
-    stdin_tx: mpsc::Sender<LspInputMessage>,
-    /// Broadcast channel for LSP stdout messages
-    stdout_tx: broadcast::Sender<Vec<u8>>,
-    /// Handle to monitor the LSP process (kept alive for task lifetime)
-    #[allow(dead_code)]
-    monitor_handle: tokio::task::JoinHandle<()>,
-    /// Counter for active clients
-    active_clients: Arc<AtomicU64>,
-}
-
-/// State shared across all WebSocket connections
+#[derive(Clone)]
 struct LspState {
     config: Arc<LspBridgeConfig>,
-    /// The shared LSP process, if spawned
-    lsp_process: Arc<RwLock<Option<SharedLspProcess>>>,
-    /// Mutex to ensure only one process is spawned at a time
-    spawn_lock: Arc<Mutex<()>>,
-    /// Counter for generating unique client IDs
-    client_id_counter: Arc<AtomicU64>,
-}
-
-impl Clone for LspState {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            lsp_process: self.lsp_process.clone(),
-            spawn_lock: self.spawn_lock.clone(),
-            client_id_counter: self.client_id_counter.clone(),
-        }
-    }
 }
 
 pub async fn start_lsp_server(
@@ -78,7 +47,7 @@ pub async fn start_lsp_server(
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                format!("{}=debug,tower_http=info", env!("CARGO_CRATE_NAME")).into()
+                format!("{}=info,tower_http=info", env!("CARGO_CRATE_NAME")).into()
             }),
         )
         .with(tracing_subscriber::fmt::layer())
@@ -87,7 +56,7 @@ pub async fn start_lsp_server(
     tracing::info!(
         program = %config.program,
         args = ?config.args,
-        "Starting LSP bridge server (single-process mode)",
+        "Starting LSP bridge server",
     );
 
     let cors = if allow_any_origin {
@@ -107,9 +76,6 @@ pub async fn start_lsp_server(
 
     let state = LspState {
         config: Arc::new(config),
-        lsp_process: Arc::new(RwLock::new(None)),
-        spawn_lock: Arc::new(Mutex::new(())),
-        client_id_counter: Arc::new(AtomicU64::new(1)),
     };
 
     let app = Router::new()
@@ -133,7 +99,10 @@ pub async fn start_lsp_server(
         }
         Err(e) => {
             if e.kind() == std::io::ErrorKind::AddrInUse {
-                tracing::error!("Port is already in use please kill all other instances of axs server or stop any other process or app that maybe be using port {}", port);
+                tracing::error!(
+                    "Port {} is already in use. Please kill other instances or apps using this port.",
+                    port
+                );
             } else {
                 tracing::error!("Failed to bind: {}", e);
             }
@@ -143,440 +112,313 @@ pub async fn start_lsp_server(
 
 async fn upgrade_lsp_bridge(
     ws: WebSocketUpgrade,
-    State(state): State<LspState>,
+    axum::extract::State(state): axum::extract::State<LspState>,
 ) -> impl IntoResponse {
+    let config = state.config.clone();
     ws.on_upgrade(move |socket| async move {
-        if let Err(err) = handle_client(socket, state).await {
-            tracing::error!(error = %err, "LSP bridge session ended with error");
+        tracing::info!("connected");
+        if let Err(err) = run_bridge(socket, config).await {
+            tracing::error!(error = %err, "connection error");
         }
+        tracing::info!("disconnected");
     })
 }
 
-/// Ensures the LSP process is running, spawning it if necessary
-async fn ensure_lsp_process(state: &LspState) -> Result<(), String> {
-    // Quick check without lock
-    {
-        let guard = state.lsp_process.read().await;
-        if guard.is_some() {
-            return Ok(());
-        }
-    }
-
-    // Acquire spawn lock to prevent race conditions
-    let _spawn_guard = state.spawn_lock.lock().await;
-
-    // Double-check after acquiring lock
-    {
-        let guard = state.lsp_process.read().await;
-        if guard.is_some() {
-            return Ok(());
-        }
-    }
-
-    // Spawn the LSP process
-    spawn_lsp_process(state).await
-}
-
-/// Spawns a new LSP process and sets up communication channels
-async fn spawn_lsp_process(state: &LspState) -> Result<(), String> {
-    let config = &state.config;
-
+/// Run the bridge between a WebSocket client and an LSP server process
+async fn run_bridge(socket: WebSocket, config: Arc<LspBridgeConfig>) -> Result<(), String> {
     let mut command = Command::new(&config.program);
     command.args(&config.args);
-    command.stdin(std::process::Stdio::piped());
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.kill_on_drop(true);
+
+    tracing::info!(
+        "starting {} in {:?}",
+        config.program,
+        std::env::current_dir()
+    );
 
     let mut child = command
         .spawn()
         .map_err(|e| format!("Failed to spawn LSP command '{}': {e}", config.program))?;
 
-    tracing::info!(
-        program = %config.program,
-        args = ?config.args,
-        "LSP process spawned (shared across all clients)",
-    );
+    tracing::trace!("running {}", config.program);
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Failed to capture LSP stdout".to_string())?;
     let stdin = child
         .stdin
         .take()
         .ok_or_else(|| "Failed to capture LSP stdin".to_string())?;
-    let stderr = child.stderr.take();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture LSP stdout".to_string())?;
 
-    // Handle stderr logging
-    if let Some(stderr) = stderr {
-        tokio::spawn(async move {
-            if let Err(err) = forward_stderr(stderr).await {
-                tracing::error!(error = %err, "Failed to read LSP stderr");
-            }
-        });
-    }
+    // Create framed readers/writers
+    let mut server_send = FramedWrite::new(stdin, LspFrameCodec::default());
+    let mut server_recv = FramedRead::new(stdout, LspFrameCodec::default());
 
-    // Create channels for communication
-    let (stdin_tx, stdin_rx) = mpsc::channel::<LspInputMessage>(256);
-    let (stdout_tx, _) = broadcast::channel::<Vec<u8>>(256);
-    let active_clients = Arc::new(AtomicU64::new(0));
+    // Split WebSocket
+    let (mut client_send, client_recv) = socket.split();
 
-    // Spawn stdin writer task
-    let stdin_handle = tokio::spawn(forward_to_lsp_stdin(stdin, stdin_rx));
+    // Process client messages, filtering to just what we care about
+    let mut client_recv = client_recv.filter_map(filter_map_ws_message).boxed();
 
-    // Spawn stdout reader task
-    let stdout_tx_clone = stdout_tx.clone();
-    let stdout_handle = tokio::spawn(forward_lsp_stdout(stdout, stdout_tx_clone));
+    let mut client_msg = client_recv.next();
+    let mut server_msg = server_recv.next();
 
-    // Spawn monitor task
-    let lsp_process_ref = state.lsp_process.clone();
-    let config_clone = state.config.clone();
-    let active_clients_clone = active_clients.clone();
-
-    let monitor_handle = tokio::spawn(async move {
-        // Wait for either stdin or stdout tasks to complete (indicating LSP exit)
+    loop {
         tokio::select! {
-            _ = stdin_handle => {
-                tracing::debug!("LSP stdin task completed");
-            }
-            _ = stdout_handle => {
-                tracing::debug!("LSP stdout task completed");
-            }
-        }
+            // From Client
+            from_client = &mut client_msg => {
+                match from_client {
+                    // Text message from client
+                    Some(Ok(ClientMessage::Text(text))) => {
+                        tracing::trace!("-> {}", if text.len() > 200 { &text[..200] } else { &text });
+                        if let Err(e) = server_send.send(text).await {
+                            tracing::error!(error = %e, "failed to send to server");
+                            break;
+                        }
+                    }
 
-        // Wait for the child process to exit
-        let exit_result = child.wait().await;
+                    // Ping from client
+                    Some(Ok(ClientMessage::Ping(data))) => {
+                        if client_send.send(Message::Pong(data.into())).await.is_err() {
+                            break;
+                        }
+                    }
 
-        match exit_result {
-            Ok(status) => {
-                if status.success() {
-                    tracing::info!("LSP process exited cleanly");
-                } else {
-                    tracing::warn!(?status, "LSP process exited with non-zero status");
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to wait for LSP process");
-            }
-        }
+                    // Pong from client (keep-alive response)
+                    Some(Ok(ClientMessage::Pong)) => {
+                        tracing::trace!("received pong");
+                    }
 
-        // Clear the shared process so a new one can be spawned
-        {
-            let mut guard = lsp_process_ref.write().await;
-            *guard = None;
-        }
+                    // Close from client
+                    Some(Ok(ClientMessage::Close)) => {
+                        tracing::info!("received Close message");
+                        break;
+                    }
 
-        // If there are still active clients, we should respawn
-        let remaining_clients = active_clients_clone.load(Ordering::SeqCst);
-        if remaining_clients > 0 {
-            tracing::warn!(
-                clients = remaining_clients,
-                "LSP process died while clients still connected",
-            );
-        }
+                    // WebSocket error
+                    Some(Err(e)) => {
+                        tracing::error!(error = %e, "websocket error");
+                        break;
+                    }
 
-        tracing::info!(
-            program = %config_clone.program,
-            "LSP process terminated, will respawn on next client request"
-        );
-    });
-
-    // Store the shared process
-    {
-        let mut guard = state.lsp_process.write().await;
-        *guard = Some(SharedLspProcess {
-            stdin_tx,
-            stdout_tx,
-            monitor_handle,
-            active_clients,
-        });
-    }
-
-    Ok(())
-}
-
-/// Handles a single WebSocket client connection
-async fn handle_client(socket: WebSocket, state: LspState) -> Result<(), String> {
-    let client_id = state.client_id_counter.fetch_add(1, Ordering::SeqCst);
-
-    tracing::info!(client_id, "WebSocket client connected");
-
-    // Ensure LSP process is running
-    ensure_lsp_process(&state).await?;
-
-    // Get access to the shared LSP process
-    let (stdin_tx, mut stdout_rx) = {
-        let guard = state.lsp_process.read().await;
-        let lsp = guard
-            .as_ref()
-            .ok_or_else(|| "LSP process not available".to_string())?;
-
-        // Increment active client count
-        lsp.active_clients.fetch_add(1, Ordering::SeqCst);
-
-        (lsp.stdin_tx.clone(), lsp.stdout_tx.subscribe())
-    };
-
-    let (mut ws_sender, ws_receiver) = socket.split();
-    let (ws_send_tx, mut ws_send_rx) = mpsc::channel::<Message>(32);
-    let (client_closed_tx, client_closed_rx) = oneshot::channel::<()>();
-
-    // Task to forward messages from WebSocket to LSP stdin
-    let stdin_tx_clone = stdin_tx.clone();
-    let ws_send_tx_clone = ws_send_tx.clone();
-    let ws_to_lsp_task = tokio::spawn(async move {
-        forward_client_to_lsp(
-            ws_receiver,
-            stdin_tx_clone,
-            ws_send_tx_clone,
-            client_closed_tx,
-            client_id,
-        )
-        .await
-    });
-
-    // Task to forward LSP stdout to this WebSocket
-    let ws_send_tx_clone = ws_send_tx.clone();
-    let lsp_to_ws_task = tokio::spawn(async move {
-        loop {
-            match stdout_rx.recv().await {
-                Ok(data) => {
-                    let message = match String::from_utf8(data.clone()) {
-                        Ok(text) => Message::Text(text.into()),
-                        Err(_) => Message::Binary(data.into()),
-                    };
-
-                    if ws_send_tx_clone.send(message).await.is_err() {
+                    // Connection closed
+                    None => {
+                        tracing::info!("connection closed");
                         break;
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(
-                        client_id,
-                        skipped,
-                        "Client lagged behind, some messages were skipped"
-                    );
+
+                client_msg = client_recv.next();
+            }
+
+            // From Server
+            from_server = &mut server_msg => {
+                match from_server {
+                    // Serialized LSP message
+                    Some(Ok(text)) => {
+                        tracing::trace!("<- {}", if text.len() > 200 { &text[..200] } else { &text });
+                        if client_send.send(Message::Text(text.into())).await.is_err() {
+                            tracing::error!("failed to send to client");
+                            break;
+                        }
+                    }
+
+                    // Codec error
+                    Some(Err(e)) => {
+                        tracing::error!(error = %e, "codec error");
+                    }
+
+                    // Server exited
+                    None => {
+                        tracing::error!("server process exited unexpectedly");
+                        let _ = client_send.send(Message::Close(None)).await;
+                        break;
+                    }
                 }
+
+                server_msg = server_recv.next();
             }
-        }
-    });
-
-    // Task to send messages through WebSocket
-    let ws_sender_task = tokio::spawn(async move {
-        while let Some(msg) = ws_send_rx.recv().await {
-            if let Message::Close(_) = msg {
-                let _ = ws_sender.send(msg).await;
-                break;
-            }
-            if ws_sender.send(msg).await.is_err() {
-                break;
-            }
-        }
-        let _ = ws_sender.close().await;
-    });
-
-    // Wait for client to close
-    let _ = client_closed_rx.await;
-
-    // Clean up
-    let _ = ws_send_tx.send(Message::Close(None)).await;
-    drop(ws_send_tx);
-
-    lsp_to_ws_task.abort();
-    let _ = ws_to_lsp_task.await;
-    let _ = ws_sender_task.await;
-
-    // Decrement active client count
-    {
-        let guard = state.lsp_process.read().await;
-        if let Some(lsp) = guard.as_ref() {
-            let remaining = lsp.active_clients.fetch_sub(1, Ordering::SeqCst) - 1;
-            tracing::info!(
-                client_id,
-                remaining_clients = remaining,
-                "WebSocket client disconnected"
-            );
         }
     }
 
     Ok(())
 }
 
-/// Forwards messages from WebSocket client to LSP stdin
-async fn forward_client_to_lsp(
-    mut receiver: futures::stream::SplitStream<WebSocket>,
-    stdin_tx: mpsc::Sender<LspInputMessage>,
-    ws_tx: mpsc::Sender<Message>,
-    shutdown_tx: oneshot::Sender<()>,
-    client_id: ClientId,
-) {
-    while let Some(msg) = receiver.next().await {
-        match msg {
-            Ok(Message::Binary(data)) => {
-                // Binary messages are sent as-is (already has Content-Length header)
-                if stdin_tx
-                    .send(LspInputMessage {
-                        data: data.to_vec(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    tracing::error!(client_id, "Failed to send to LSP stdin channel");
-                    break;
-                }
-            }
-            Ok(Message::Text(text)) => {
-                // Text messages need Content-Length header added
-                let body = text.as_bytes();
-                let header = format!("Content-Length: {}\r\n\r\n", body.len());
-                let mut data = Vec::with_capacity(header.len() + body.len());
-                data.extend_from_slice(header.as_bytes());
-                data.extend_from_slice(body);
+// Client message handling
 
-                if stdin_tx.send(LspInputMessage { data }).await.is_err() {
-                    tracing::error!(client_id, "Failed to send to LSP stdin channel");
-                    break;
-                }
-            }
-            Ok(Message::Ping(payload)) => {
-                let _ = ws_tx.send(Message::Pong(payload)).await;
-            }
-            Ok(Message::Pong(_)) => {}
-            Ok(Message::Close(frame)) => {
-                let _ = ws_tx.send(Message::Close(frame)).await;
-                break;
-            }
-            Err(err) => {
-                tracing::error!(client_id, error = %err, "WebSocket receive error");
-                break;
-            }
-        }
-    }
-
-    let _ = shutdown_tx.send(());
+enum ClientMessage {
+    Text(String),
+    Ping(Vec<u8>),
+    Pong,
+    Close,
 }
 
-/// Forwards messages from channel to LSP stdin
-async fn forward_to_lsp_stdin(mut stdin: ChildStdin, mut rx: mpsc::Receiver<LspInputMessage>) {
-    while let Some(msg) = rx.recv().await {
-        if let Err(err) = stdin.write_all(&msg.data).await {
-            tracing::error!(error = %err, "Failed to write to LSP stdin");
-            break;
+async fn filter_map_ws_message(
+    msg: Result<Message, axum::Error>,
+) -> Option<Result<ClientMessage, axum::Error>> {
+    match msg {
+        Ok(Message::Text(text)) => Some(Ok(ClientMessage::Text(text.to_string()))),
+        Ok(Message::Binary(data)) => {
+            // Try to decode as text
+            match String::from_utf8(data.to_vec()) {
+                Ok(text) => Some(Ok(ClientMessage::Text(text))),
+                Err(_) => None, // Ignore non-UTF8 binary
+            }
         }
-        if let Err(err) = stdin.flush().await {
-            tracing::error!(error = %err, "Failed to flush LSP stdin");
-            break;
-        }
+        Ok(Message::Ping(data)) => Some(Ok(ClientMessage::Ping(data.to_vec()))),
+        Ok(Message::Pong(_)) => Some(Ok(ClientMessage::Pong)),
+        Ok(Message::Close(_)) => Some(Ok(ClientMessage::Close)),
+        Err(e) => Some(Err(e)),
     }
-
-    let _ = stdin.shutdown().await;
 }
 
-/// Reads LSP stdout and broadcasts to all connected clients
-async fn forward_lsp_stdout(mut stdout: ChildStdout, tx: broadcast::Sender<Vec<u8>>) {
-    let mut buf = vec![0u8; 8192];
-    let mut decoder = LspMessageFramer::default();
+#[derive(Debug)]
+pub enum CodecError {
+    MissingHeader,
+    InvalidLength,
+    InvalidType,
+    Encode(std::io::Error),
+    Utf8(std::str::Utf8Error),
+}
 
-    loop {
-        match stdout.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                if let Err(err) = decoder.push(&buf[..n]) {
-                    tracing::error!(error = %err, "Failed to decode LSP stdout stream");
-                    break;
-                }
-
-                while let Some(frame) = decoder.next_message() {
-                    // Broadcast to all connected clients
-                    // It's okay if there are no receivers
-                    let _ = tx.send(frame);
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => {
-                tracing::error!(error = %err, "Failed to read from LSP stdout");
-                break;
-            }
+impl std::fmt::Display for CodecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingHeader => write!(f, "missing required `Content-Length` header"),
+            Self::InvalidLength => write!(f, "unable to parse content length"),
+            Self::InvalidType => write!(f, "unable to parse content type"),
+            Self::Encode(e) => write!(f, "failed to encode frame: {}", e),
+            Self::Utf8(e) => write!(f, "frame contains invalid UTF8: {}", e),
         }
     }
 }
 
-#[derive(Default)]
-struct LspMessageFramer {
-    buffer: Vec<u8>,
-    messages: VecDeque<Vec<u8>>,
+impl std::error::Error for CodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Encode(e) => Some(e),
+            Self::Utf8(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
-impl LspMessageFramer {
-    fn push(&mut self, chunk: &[u8]) -> Result<(), String> {
-        self.buffer.extend_from_slice(chunk);
+impl From<std::io::Error> for CodecError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Encode(error)
+    }
+}
 
-        loop {
-            let Some(header_end) = find_header_terminator(&self.buffer) else {
-                break;
-            };
+impl From<std::str::Utf8Error> for CodecError {
+    fn from(error: std::str::Utf8Error) -> Self {
+        Self::Utf8(error)
+    }
+}
 
-            let headers = &self.buffer[..header_end];
-            let content_length = parse_content_length(headers)?;
-            let body_start = header_end + 4;
-            let frame_len = body_start + content_length;
+#[derive(Clone, Debug, Default)]
+pub struct LspFrameCodec {
+    remaining_bytes: usize,
+}
 
-            if self.buffer.len() < frame_len {
-                break;
-            }
+impl Encoder<String> for LspFrameCodec {
+    type Error = CodecError;
 
-            let body = self.buffer[body_start..frame_len].to_vec();
-            self.buffer.drain(..frame_len);
-            self.messages.push_back(body);
+    fn encode(&mut self, item: String, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        if !item.is_empty() {
+            // Reserve space: "Content-Length: " (16) + digits + "\r\n\r\n" (4) + body
+            dst.reserve(item.len() + number_of_digits(item.len()) + 20);
+            let mut writer = dst.writer();
+            write!(writer, "Content-Length: {}\r\n\r\n{}", item.len(), item)?;
+            writer.flush()?;
         }
-
         Ok(())
     }
-
-    fn next_message(&mut self) -> Option<Vec<u8>> {
-        self.messages.pop_front()
-    }
 }
 
-fn find_header_terminator(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(4).position(|window| window == b"\r\n\r\n")
-}
+impl Decoder for LspFrameCodec {
+    type Item = String;
+    type Error = CodecError;
 
-fn parse_content_length(header: &[u8]) -> Result<usize, String> {
-    let header_str =
-        std::str::from_utf8(header).map_err(|_| "Invalid UTF-8 in LSP header".to_string())?;
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if self.remaining_bytes > src.len() {
+            return Ok(None);
+        }
 
-    for line in header_str.split("\r\n") {
-        let mut parts = line.splitn(2, ':');
-        let key = parts.next().map(str::trim);
-        let value = parts.next().map(str::trim);
+        match parse_message(src) {
+            Ok((remaining, message)) => {
+                let message = str::from_utf8(message)?.to_string();
+                let len = src.len() - remaining.len();
+                src.advance(len);
+                self.remaining_bytes = 0;
+                // Ignore empty frame
+                if message.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(message))
+                }
+            }
 
-        if let (Some(key), Some(value)) = (key, value) {
-            if key.eq_ignore_ascii_case("content-length") {
-                return value
-                    .parse::<usize>()
-                    .map_err(|_| format!("Invalid Content-Length header: {value}"));
+            Err(nom::Err::Incomplete(nom::Needed::Size(needed))) => {
+                self.remaining_bytes = needed.get();
+                Ok(None)
+            }
+
+            Err(nom::Err::Incomplete(nom::Needed::Unknown)) => Ok(None),
+
+            Err(nom::Err::Error(err)) | Err(nom::Err::Failure(err)) => {
+                let code = err.code;
+                let parsed_bytes = src.len() - err.input.len();
+                src.advance(parsed_bytes);
+                match find_next_message(src) {
+                    Ok((_, position)) => src.advance(position),
+                    Err(_) => src.advance(src.len()),
+                }
+                match code {
+                    nom::error::ErrorKind::Digit | nom::error::ErrorKind::MapRes => {
+                        Err(CodecError::InvalidLength)
+                    }
+                    nom::error::ErrorKind::Char | nom::error::ErrorKind::IsNot => {
+                        Err(CodecError::InvalidType)
+                    }
+                    _ => Err(CodecError::MissingHeader),
+                }
             }
         }
     }
-
-    Err("Missing Content-Length header".to_string())
 }
 
-async fn forward_stderr(stderr: ChildStderr) -> Result<(), std::io::Error> {
-    let mut reader = BufReader::new(stderr);
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        let read = reader.read_line(&mut line).await?;
-        if read == 0 {
-            break;
-        }
-
-        tracing::warn!(target: "lsp_stderr", message = %line.trim_end());
+#[inline]
+fn number_of_digits(mut n: usize) -> usize {
+    let mut num_digits = 0;
+    while n > 0 {
+        n /= 10;
+        num_digits += 1;
     }
+    num_digits
+}
 
-    Ok(())
+// LSP Message Parser
+
+/// Get JSON message from input using the Content-Length header.
+fn parse_message(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    let content_len = delimited(tag("Content-Length: "), digit1, crlf);
+
+    let utf8 = alt((tag("utf-8"), tag("utf8")));
+    let charset = tuple((char(';'), space0, tag("charset="), utf8));
+    let content_type = tuple((tag("Content-Type: "), is_not(";\r"), opt(charset), crlf));
+
+    let header = terminated(terminated(content_len, opt(content_type)), crlf);
+
+    let header = map_res(header, str::from_utf8);
+    let length = map_res(header, |s: &str| s.parse::<usize>());
+    let mut message = length_data(length);
+
+    message(input)
+}
+
+fn find_next_message(input: &[u8]) -> IResult<&[u8], usize> {
+    map(take_until("Content-Length"), |s: &[u8]| s.len())(input)
 }
