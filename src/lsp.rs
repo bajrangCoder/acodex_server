@@ -19,8 +19,6 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-
-
 #[derive(Clone)]
 pub struct LspBridgeConfig {
     pub program: String,
@@ -327,7 +325,14 @@ async fn handle_client(socket: WebSocket, state: LspState) -> Result<(), String>
     let stdin_tx_clone = stdin_tx.clone();
     let ws_send_tx_clone = ws_send_tx.clone();
     let ws_to_lsp_task = tokio::spawn(async move {
-        forward_client_to_lsp(ws_receiver, stdin_tx_clone, ws_send_tx_clone, client_closed_tx, client_id).await
+        forward_client_to_lsp(
+            ws_receiver,
+            stdin_tx_clone,
+            ws_send_tx_clone,
+            client_closed_tx,
+            client_id,
+        )
+        .await
     });
 
     // Task to forward LSP stdout to this WebSocket
@@ -387,7 +392,11 @@ async fn handle_client(socket: WebSocket, state: LspState) -> Result<(), String>
         let guard = state.lsp_process.read().await;
         if let Some(lsp) = guard.as_ref() {
             let remaining = lsp.active_clients.fetch_sub(1, Ordering::SeqCst) - 1;
-            tracing::info!(client_id, remaining_clients = remaining, "WebSocket client disconnected");
+            tracing::info!(
+                client_id,
+                remaining_clients = remaining,
+                "WebSocket client disconnected"
+            );
         }
     }
 
@@ -407,7 +416,9 @@ async fn forward_client_to_lsp(
             Ok(Message::Binary(data)) => {
                 // Binary messages are sent as-is (already has Content-Length header)
                 if stdin_tx
-                    .send(LspInputMessage { data: data.to_vec() })
+                    .send(LspInputMessage {
+                        data: data.to_vec(),
+                    })
                     .await
                     .is_err()
                 {
@@ -447,10 +458,7 @@ async fn forward_client_to_lsp(
 }
 
 /// Forwards messages from channel to LSP stdin
-async fn forward_to_lsp_stdin(
-    mut stdin: ChildStdin,
-    mut rx: mpsc::Receiver<LspInputMessage>,
-) {
+async fn forward_to_lsp_stdin(mut stdin: ChildStdin, mut rx: mpsc::Receiver<LspInputMessage>) {
     while let Some(msg) = rx.recv().await {
         if let Err(err) = stdin.write_all(&msg.data).await {
             tracing::error!(error = %err, "Failed to write to LSP stdin");
