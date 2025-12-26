@@ -38,9 +38,53 @@ struct LspState {
     config: Arc<LspBridgeConfig>,
 }
 
+/// Guard that cleans up the port file on drop
+struct PortFileGuard {
+    path: std::path::PathBuf,
+}
+
+impl Drop for PortFileGuard {
+    fn drop(&mut self) {
+        if self.path.exists() {
+            let _ = std::fs::remove_file(&self.path);
+            tracing::debug!("Cleaned up port file: {:?}", self.path);
+        }
+    }
+}
+
+/// Get the port file path for a given server and session
+fn get_port_file_path(program: &str, session: Option<&str>) -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let dir = std::path::PathBuf::from(home)
+        .join(".axs")
+        .join("lsp_ports");
+
+    // Use just the binary name (not full path)
+    let server_name = std::path::Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program);
+
+    let filename = match session {
+        Some(s) => format!("{}_{}", server_name, s),
+        None => format!("{}_{}", server_name, std::process::id()),
+    };
+
+    dir.join(filename)
+}
+
+/// Write port to discovery file
+fn write_port_file(path: &std::path::Path, port: u16) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, port.to_string())
+}
+
 pub async fn start_lsp_server(
     host: Ipv4Addr,
-    port: u16,
+    port: Option<u16>,
+    session: Option<String>,
     allow_any_origin: bool,
     config: LspBridgeConfig,
 ) {
@@ -75,7 +119,7 @@ pub async fn start_lsp_server(
     };
 
     let state = LspState {
-        config: Arc::new(config),
+        config: Arc::new(config.clone()),
     };
 
     let app = Router::new()
@@ -87,11 +131,29 @@ pub async fn start_lsp_server(
         )
         .layer(cors);
 
-    let addr: std::net::SocketAddr = (host, port).into();
+    // Use specified port or 0 for auto-selection
+    let bind_port = port.unwrap_or(0);
+    let addr: std::net::SocketAddr = (host, bind_port).into();
 
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
-            tracing::info!("listening on {}", listener.local_addr().unwrap());
+            let actual_addr = listener.local_addr().unwrap();
+            let actual_port = actual_addr.port();
+
+            tracing::info!("listening on {}", actual_addr);
+
+            // Write port to discovery file
+            let port_file_path = get_port_file_path(&config.program, session.as_deref());
+            if let Err(e) = write_port_file(&port_file_path, actual_port) {
+                tracing::warn!("Failed to write port file: {}", e);
+            } else {
+                tracing::info!("Port file: {:?}", port_file_path);
+            }
+
+            // Guard will clean up port file on drop
+            let _guard = PortFileGuard {
+                path: port_file_path,
+            };
 
             if let Err(e) = axum::serve(listener, app).await {
                 tracing::error!("Server error: {}", e);
@@ -101,7 +163,7 @@ pub async fn start_lsp_server(
             if e.kind() == std::io::ErrorKind::AddrInUse {
                 tracing::error!(
                     "Port {} is already in use. Please kill other instances or apps using this port.",
-                    port
+                    bind_port
                 );
             } else {
                 tracing::error!("Failed to bind: {}", e);

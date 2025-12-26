@@ -39,6 +39,9 @@ enum Commands {
     Update,
     /// Start a WebSocket LSP bridge for a stdio language server
     Lsp {
+        /// Session ID for port discovery (allows multiple instances of same server)
+        #[arg(short = 's', long)]
+        session: Option<String>,
         /// The language server binary to run (e.g. "rust-analyzer")
         server: String,
         /// Additional arguments to forward to the language server
@@ -140,6 +143,7 @@ async fn main() {
             }
         }
         Some(Commands::Lsp {
+            session,
             server,
             server_args,
         }) => {
@@ -162,7 +166,14 @@ async fn main() {
                 args: server_args,
             };
 
-            start_lsp_server(host, port, allow_any_origin, config).await;
+            // Use specified port if not default, otherwise auto-select
+            let lsp_port = if port != DEFAULT_PORT {
+                Some(port)
+            } else {
+                None
+            };
+
+            start_lsp_server(host, lsp_port, session, allow_any_origin, config).await;
         }
         None => {
             tokio::task::spawn(check_updates_in_background());
