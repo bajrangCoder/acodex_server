@@ -61,7 +61,7 @@ To build acodex_server from source, follow these steps:
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-username/acodex_server.git
+   git clone https://github.com/bajrangCoder/acodex_server.git
    ```
 
 2. Ensure that Rust is installed on your system.
