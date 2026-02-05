@@ -4,7 +4,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderValue;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{SinkExt, StreamExt};
 use nom::{
@@ -16,12 +16,17 @@ use nom::{
     sequence::{delimited, terminated, tuple},
     IResult,
 };
+use serde::Serialize;
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::Ipv4Addr;
 use std::process::Stdio;
 use std::str;
 use std::sync::Arc;
+use std::time::Instant;
+use sysinfo::{Pid, System};
 use tokio::process::Command;
+use tokio::sync::RwLock;
 use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
@@ -33,9 +38,30 @@ pub struct LspBridgeConfig {
     pub args: Vec<String>,
 }
 
+struct LspProcessInfo {
+    pid: u32,
+    started_at: Instant,
+}
+
+type ProcessRegistry = Arc<RwLock<HashMap<u32, LspProcessInfo>>>;
+
 #[derive(Clone)]
 struct LspState {
     config: Arc<LspBridgeConfig>,
+    processes: ProcessRegistry,
+}
+
+#[derive(Serialize)]
+struct LspProcessStatus {
+    pid: u32,
+    uptime_secs: u64,
+    memory_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct LspStatusResponse {
+    program: String,
+    processes: Vec<LspProcessStatus>,
 }
 
 /// Guard that cleans up the port file on drop
@@ -120,10 +146,12 @@ pub async fn start_lsp_server(
 
     let state = LspState {
         config: Arc::new(config.clone()),
+        processes: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let app = Router::new()
         .route("/", get(upgrade_lsp_bridge))
+        .route("/status", get(get_lsp_status))
         .with_state(state)
         .layer(
             TraceLayer::new_for_http()
@@ -177,21 +205,57 @@ async fn upgrade_lsp_bridge(
     axum::extract::State(state): axum::extract::State<LspState>,
 ) -> impl IntoResponse {
     let config = state.config.clone();
+    let processes = state.processes.clone();
     ws.on_upgrade(move |socket| async move {
         tracing::info!("connected");
-        if let Err(err) = run_bridge(socket, config).await {
+        if let Err(err) = run_bridge(socket, config, processes).await {
             tracing::error!(error = %err, "connection error");
         }
         tracing::info!("disconnected");
     })
 }
 
+async fn get_lsp_status(
+    axum::extract::State(state): axum::extract::State<LspState>,
+) -> Json<LspStatusResponse> {
+    let processes = state.processes.read().await;
+    let mut sys = System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+    let process_stats: Vec<LspProcessStatus> = processes
+        .values()
+        .filter_map(|info| {
+            let uptime_secs = info.started_at.elapsed().as_secs();
+            let memory_bytes = sys
+                .process(Pid::from_u32(info.pid))
+                .map(|p| p.memory())
+                .unwrap_or(0);
+
+            Some(LspProcessStatus {
+                pid: info.pid,
+                uptime_secs,
+                memory_bytes,
+            })
+        })
+        .collect();
+
+    Json(LspStatusResponse {
+        program: state.config.program.clone(),
+        processes: process_stats,
+    })
+}
+
 /// Run the bridge between a WebSocket client and an LSP server process
-async fn run_bridge(socket: WebSocket, config: Arc<LspBridgeConfig>) -> Result<(), String> {
+async fn run_bridge(
+    socket: WebSocket,
+    config: Arc<LspBridgeConfig>,
+    processes: ProcessRegistry,
+) -> Result<(), String> {
     let mut command = Command::new(&config.program);
     command.args(&config.args);
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
     command.kill_on_drop(true);
 
     tracing::info!(
@@ -206,6 +270,16 @@ async fn run_bridge(socket: WebSocket, config: Arc<LspBridgeConfig>) -> Result<(
 
     tracing::trace!("running {}", config.program);
 
+    let pid = child.id().ok_or_else(|| "Failed to get LSP process ID".to_string())?;
+
+    {
+        let mut procs = processes.write().await;
+        procs.insert(pid, LspProcessInfo {
+            pid,
+            started_at: Instant::now(),
+        });
+    }
+
     let stdin = child
         .stdin
         .take()
@@ -214,6 +288,20 @@ async fn run_bridge(socket: WebSocket, config: Arc<LspBridgeConfig>) -> Result<(
         .stdout
         .take()
         .ok_or_else(|| "Failed to capture LSP stdout".to_string())?;
+
+    if let Some(stderr) = child.stderr.take() {
+        let program_name = config.program.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                eprintln!("[LSP-STDERR:{}] {}", program_name, line);
+                tracing::warn!(target: "lsp_stderr", program = %program_name, "{}", line);
+            }
+        });
+    }
+
+    let cleanup_processes = processes.clone();
 
     // Create framed readers/writers
     let mut server_send = FramedWrite::new(stdin, LspFrameCodec::default());
@@ -304,6 +392,11 @@ async fn run_bridge(socket: WebSocket, config: Arc<LspBridgeConfig>) -> Result<(
                 server_msg = server_recv.next();
             }
         }
+    }
+
+    {
+        let mut procs = cleanup_processes.write().await;
+        procs.remove(&pid);
     }
 
     Ok(())

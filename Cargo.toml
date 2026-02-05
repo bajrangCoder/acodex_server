@@ -1,6 +1,6 @@
 [package]
 name = "axs"
-version = "0.2.11"
+version = "0.2.12"
 edition = "2021"
 
 
@@ -26,3 +26,4 @@ nom = "7.1"
 tower-http = { version = "0.6.2", features = ["cors", "trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+sysinfo = "0.38.0"
