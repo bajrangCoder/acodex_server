@@ -224,18 +224,18 @@ async fn get_lsp_status(
 
     let process_stats: Vec<LspProcessStatus> = processes
         .values()
-        .filter_map(|info| {
+        .map(|info| {
             let uptime_secs = info.started_at.elapsed().as_secs();
             let memory_bytes = sys
                 .process(Pid::from_u32(info.pid))
                 .map(|p| p.memory())
                 .unwrap_or(0);
 
-            Some(LspProcessStatus {
+            LspProcessStatus {
                 pid: info.pid,
                 uptime_secs,
                 memory_bytes,
-            })
+            }
         })
         .collect();
 
@@ -270,14 +270,19 @@ async fn run_bridge(
 
     tracing::trace!("running {}", config.program);
 
-    let pid = child.id().ok_or_else(|| "Failed to get LSP process ID".to_string())?;
+    let pid = child
+        .id()
+        .ok_or_else(|| "Failed to get LSP process ID".to_string())?;
 
     {
         let mut procs = processes.write().await;
-        procs.insert(pid, LspProcessInfo {
+        procs.insert(
             pid,
-            started_at: Instant::now(),
-        });
+            LspProcessInfo {
+                pid,
+                started_at: Instant::now(),
+            },
+        );
     }
 
     let stdin = child
