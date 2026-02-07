@@ -117,7 +117,11 @@ pub async fn start_lsp_server(
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                format!("{}=info,tower_http=info", env!("CARGO_CRATE_NAME")).into()
+                format!(
+                    "{}=info,tower_http=info,lsp_stderr=warn",
+                    env!("CARGO_CRATE_NAME")
+                )
+                .into()
             }),
         )
         .with(tracing_subscriber::fmt::layer())
