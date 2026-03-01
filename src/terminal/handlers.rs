@@ -12,10 +12,9 @@ use axum::{
     Json,
 };
 use futures::{SinkExt, StreamExt};
-use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use regex::Regex;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 use std::{
     io::Read,
@@ -29,11 +28,11 @@ use tokio::task::spawn_blocking;
 pub struct TerminalSession {
     pub master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     pub child_killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
-    pub child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
-    pub reader: Arc<Mutex<Box<dyn Read + Send>>>,
     pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub scrollback: Arc<Scrollback>,
-    pub ws_connected: Arc<AtomicBool>,
+    pub output_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>>,
+    pub exit_status: Arc<std::sync::Mutex<Option<bool>>>,
+    pub exit_notify: Arc<tokio::sync::Notify>,
     pub last_accessed: Arc<Mutex<SystemTime>>,
 }
 
@@ -79,19 +78,74 @@ pub async fn create_terminal(
                     tracing::info!("Terminal created successfully with PID: {}", pid);
                     drop(pair.slave);
 
-                    let reader = Arc::new(Mutex::new(pair.master.try_clone_reader().unwrap()));
+                    let reader = pair.master.try_clone_reader().unwrap();
                     let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
                     let master = Arc::new(Mutex::new(pair.master as Box<dyn MasterPty + Send>));
                     let child_killer = Arc::new(Mutex::new(child.clone_killer()));
 
+                    let scrollback = Arc::new(Scrollback::new(pid));
+                    let output_tx: Arc<
+                        std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
+                    > = Arc::new(std::sync::Mutex::new(None));
+                    let exit_status: Arc<std::sync::Mutex<Option<bool>>> =
+                        Arc::new(std::sync::Mutex::new(None));
+                    let exit_notify = Arc::new(tokio::sync::Notify::new());
+
+                    // Background PTY reader — runs for the session lifetime
+                    {
+                        let scrollback = scrollback.clone();
+                        let output_tx = output_tx.clone();
+                        spawn_blocking(move || {
+                            let mut reader = reader;
+                            let mut read_buffer = [0u8; 8192];
+                            loop {
+                                let n = match reader.read(&mut read_buffer) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => break,
+                                };
+
+                                let data = &read_buffer[..n];
+                                let _ = scrollback.append(data);
+
+                                if let Ok(guard) = output_tx.try_lock() {
+                                    if let Some(ref tx) = *guard {
+                                        let _ = tx.try_send(data.to_vec());
+                                    }
+                                }
+                            }
+                            tracing::info!("Background PTY reader exited for PID {}", pid);
+                        });
+                    }
+
+                    // Background child waiter — signals when process exits
+                    {
+                        let exit_status = exit_status.clone();
+                        let exit_notify = exit_notify.clone();
+                        let child = Arc::new(std::sync::Mutex::new(child));
+                        spawn_blocking(move || {
+                            let mut child_guard = child.lock().unwrap();
+                            let success = match child_guard.wait() {
+                                Ok(status) => status.success(),
+                                Err(_) => false,
+                            };
+                            *exit_status.lock().unwrap() = Some(success);
+                            exit_notify.notify_waiters();
+                            tracing::info!(
+                                "Background child waiter exited for PID {} (success={})",
+                                pid,
+                                success
+                            );
+                        });
+                    }
+
                     let session = TerminalSession {
                         master,
                         child_killer,
-                        child: Arc::new(Mutex::new(child)),
-                        reader,
                         writer,
-                        scrollback: Arc::new(Scrollback::new(pid)),
-                        ws_connected: Arc::new(AtomicBool::new(false)),
+                        scrollback,
+                        output_tx,
+                        exit_status,
+                        exit_notify,
                         last_accessed: Arc::new(Mutex::new(SystemTime::now())),
                     };
 
@@ -161,33 +215,62 @@ pub async fn terminal_websocket(
 async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
     let (mut sender, mut receiver) = socket.split();
 
-    let (reader, writer, scrollback, child, ws_connected) = {
+    let (writer, scrollback, output_tx_arc, exit_status_arc, exit_notify) = {
         let Some(session) = sessions.get(&pid) else {
             tracing::error!("Session {} not found", pid);
             return;
         };
 
-        let mut last_accessed = session.last_accessed.lock().await;
-        *last_accessed = SystemTime::now();
-        drop(last_accessed);
-
+        *session.last_accessed.lock().await = SystemTime::now();
         tracing::info!("WebSocket connection established for terminal {}", pid);
-        session.ws_connected.store(true, Ordering::Release);
 
         (
-            session.reader.clone(),
             session.writer.clone(),
             session.scrollback.clone(),
-            session.child.clone(),
-            session.ws_connected.clone(),
+            session.output_tx.clone(),
+            session.exit_status.clone(),
+            session.exit_notify.clone(),
         )
     };
 
-    // Send scrollback contents on reconnect
-    let scrollback_for_replay = scrollback.clone();
-    match tokio::task::spawn_blocking(move || scrollback_for_replay.read_tail(MAX_SCROLLBACK_BYTES))
-        .await
+    // Check if process already exited
+    let already_exited = {
+        let guard = exit_status_arc.lock().unwrap();
+        *guard
+    };
+    if let Some(success) = already_exited {
+        let exit_message = ProcessExitMessage {
+            exit_code: Some(if success { 0 } else { 1 }),
+            signal: None,
+            message: if success {
+                "Process exited successfully"
+            } else {
+                "Process exited with non-zero status"
+            }
+            .to_string(),
+        };
+        let exit_json = serde_json::to_string(&exit_message).unwrap_or_default();
+        let _ = sender
+            .send(Message::Text(
+                format!("{{\"type\":\"exit\",\"data\":{exit_json}}}").into(),
+            ))
+            .await;
+        sessions.remove(&pid);
+        return;
+    }
+
+    // Create output channel for this WS connection
+    let (ws_output_tx, mut ws_output_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+
+    // Set the sender so background reader starts forwarding to us
     {
+        let mut guard = output_tx_arc.lock().unwrap();
+        *guard = Some(ws_output_tx);
+    }
+
+    // Send full scrollback history (client should clear terminal before connecting)
+    let scrollback_for_replay = scrollback.clone();
+    match spawn_blocking(move || scrollback_for_replay.read_tail(MAX_SCROLLBACK_BYTES)).await {
         Ok(Ok(contents)) if !contents.is_empty() => {
             let _ = sender.send(Message::Binary(Bytes::from(contents))).await;
         }
@@ -197,205 +280,115 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
         _ => {}
     }
 
-    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    let (exit_tx, mut exit_rx) = tokio::sync::mpsc::channel::<portable_pty::ExitStatus>(1);
-
-    // PTY reader task — reads from PTY with 8 KiB buffer
-    let mut pty_reader_handle = {
-        let reader = reader.clone();
-        let child = child.clone();
-
-        tokio::spawn(async move {
-            let read_task = spawn_blocking({
-                let reader = reader.clone();
-                let output_tx = output_tx.clone();
-                move || {
-                    let mut read_buffer = [0u8; 8192];
-                    loop {
-                        let n = {
-                            let mut reader_guard = reader.blocking_lock();
-                            match reader_guard.read(&mut read_buffer) {
-                                Ok(n) if n > 0 => n,
-                                _ => break,
-                            }
-                        };
-
-                        let data = read_buffer[..n].to_vec();
-                        if output_tx.blocking_send(data).is_err() {
-                            break;
-                        }
-                    }
+    // WS input → PTY writer channel
+    let (ws_input_tx, ws_input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let write_handle = {
+        let writer = writer.clone();
+        spawn_blocking(move || {
+            while let Ok(data) = ws_input_rx.recv() {
+                let mut guard = writer.blocking_lock();
+                if guard.write_all(&data).is_err() || guard.flush().is_err() {
+                    break;
                 }
-            });
-
-            let wait_task = spawn_blocking({
-                let child = child.clone();
-                let exit_tx = exit_tx.clone();
-                move || {
-                    let mut child_guard = child.blocking_lock();
-                    if let Ok(exit_status) = child_guard.wait() {
-                        let _ = exit_tx.blocking_send(exit_status);
-                    }
-                }
-            });
-
-            let _ = tokio::join!(read_task, wait_task);
+            }
         })
     };
 
-    // Output coalescing — batches reads within 8ms windows into single WS frames
-    let mut output_handler = {
-        let scrollback = scrollback.clone();
-        let ws_connected = ws_connected.clone();
-        let sessions = sessions.clone();
+    // Main loop with output coalescing
+    let mut coalesce_buf: Vec<u8> = Vec::with_capacity(16384);
+    let mut interval = tokio::time::interval(Duration::from_millis(8));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        tokio::spawn(async move {
-            let mut coalesce_buf: Vec<u8> = Vec::with_capacity(16384);
-            let mut interval = tokio::time::interval(Duration::from_millis(8));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if coalesce_buf.is_empty() {
-                            continue;
-                        }
-
-                        let frame = std::mem::replace(
-                            &mut coalesce_buf,
-                            Vec::with_capacity(16384),
-                        );
-
-                        if sender.send(Message::Binary(Bytes::from(frame))).await.is_err() {
-                            break;
-                        }
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                if !coalesce_buf.is_empty() {
+                    let frame = std::mem::replace(&mut coalesce_buf, Vec::with_capacity(16384));
+                    if sender.send(Message::Binary(Bytes::from(frame))).await.is_err() {
+                        break;
                     }
-                    data = output_rx.recv() => {
-                        match data {
-                            Some(data) => {
-                                if !ws_connected.load(Ordering::Acquire) {
-                                    let sb = scrollback.clone();
-                                    drop(tokio::task::spawn_blocking(move || {
-                                        let _ = sb.append(&data);
-                                    }));
-                                } else {
-                                    coalesce_buf.extend_from_slice(&data);
-
-                                    // Flush immediately if buffer is large enough
-                                    if coalesce_buf.len() >= 8192 {
-                                        let frame = std::mem::replace(
-                                            &mut coalesce_buf,
-                                            Vec::with_capacity(16384),
-                                        );
-                                        if sender.send(Message::Binary(Bytes::from(frame))).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            None => {
-                                // Channel closed — flush remaining data
-                                if !coalesce_buf.is_empty() {
-                                    let _ = sender.send(Message::Binary(Bytes::from(coalesce_buf))).await;
-                                }
+                }
+            }
+            data = ws_output_rx.recv() => {
+                match data {
+                    Some(data) => {
+                        coalesce_buf.extend_from_slice(&data);
+                        if coalesce_buf.len() >= 8192 {
+                            let frame = std::mem::replace(&mut coalesce_buf, Vec::with_capacity(16384));
+                            if sender.send(Message::Binary(Bytes::from(frame))).await.is_err() {
                                 break;
                             }
                         }
                     }
-                    exit_status = exit_rx.recv() => {
-                        if let Some(exit_status) = exit_status {
-                            // Flush any pending output before exit message
-                            if !coalesce_buf.is_empty() {
-                                let frame = std::mem::take(&mut coalesce_buf);
-                                let _ = sender.send(Message::Binary(Bytes::from(frame))).await;
-                            }
-
-                            let exit_message = if exit_status.success() {
-                                ProcessExitMessage {
-                                    exit_code: Some(0),
-                                    signal: None,
-                                    message: "Process exited successfully".to_string(),
-                                }
-                            } else {
-                                ProcessExitMessage {
-                                    exit_code: Some(1),
-                                    signal: None,
-                                    message: "Process exited with non-zero status".to_string(),
-                                }
-                            };
-
-                            let exit_json = serde_json::to_string(&exit_message).unwrap_or_else(|_|
-                                "{\"exit_code\":1,\"signal\":null,\"message\":\"Process exited\"}".to_string()
-                            );
-
-                            let _ = sender.send(Message::Text(format!("{{\"type\":\"exit\",\"data\":{exit_json}}}").into())).await;
-
-                            sessions.remove(&pid);
-                            break;
+                    None => {
+                        if !coalesce_buf.is_empty() {
+                            let _ = sender.send(Message::Binary(Bytes::from(std::mem::take(&mut coalesce_buf)))).await;
                         }
-                    }
-                }
-            }
-        })
-    };
-
-    // WebSocket input → PTY writer
-    let mut ws_to_pty = {
-        let writer = writer.clone();
-        tokio::spawn(async move {
-            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-            let tx = std::sync::Arc::new(tx);
-            let tx_clone = tx.clone();
-
-            let write_handle = spawn_blocking(move || {
-                while let Ok(data) = rx.recv() {
-                    let mut writer_guard = writer.blocking_lock();
-                    if writer_guard.write_all(&data).is_err() || writer_guard.flush().is_err() {
                         break;
                     }
                 }
-            });
+            }
+            _ = exit_notify.notified() => {
+                // Give the reader a moment to flush remaining output
+                tokio::time::sleep(Duration::from_millis(50)).await;
 
-            while let Some(Ok(message)) = receiver.next().await {
-                let data: Bytes = match message {
-                    Message::Text(text) => Bytes::from(text),
-                    Message::Binary(data) => data,
-                    Message::Close(_) => break,
-                    _ => continue,
+                while let Ok(data) = ws_output_rx.try_recv() {
+                    coalesce_buf.extend_from_slice(&data);
+                }
+                if !coalesce_buf.is_empty() {
+                    let _ = sender.send(Message::Binary(Bytes::from(std::mem::take(&mut coalesce_buf)))).await;
+                }
+
+                let success = exit_status_arc.lock().unwrap().unwrap_or(false);
+                let exit_message = ProcessExitMessage {
+                    exit_code: Some(if success { 0 } else { 1 }),
+                    signal: None,
+                    message: if success {
+                        "Process exited successfully"
+                    } else {
+                        "Process exited with non-zero status"
+                    }
+                    .to_string(),
                 };
+                let exit_json = serde_json::to_string(&exit_message).unwrap_or_default();
+                let _ = sender
+                    .send(Message::Text(
+                        format!("{{\"type\":\"exit\",\"data\":{exit_json}}}").into(),
+                    ))
+                    .await;
 
-                if tx_clone.send(data.to_vec()).is_err() {
-                    break;
+                sessions.remove(&pid);
+                break;
+            }
+            msg = receiver.next() => {
+                match msg {
+                    Some(Ok(message)) => {
+                        let data = match message {
+                            Message::Text(text) => text.as_bytes().to_vec(),
+                            Message::Binary(data) => data.to_vec(),
+                            Message::Close(_) => break,
+                            _ => continue,
+                        };
+                        if ws_input_tx.send(data).is_err() {
+                            break;
+                        }
+                    }
+                    None | Some(Err(_)) => break,
                 }
             }
-
-            drop(tx_clone);
-            let _ = write_handle.await;
-        })
-    };
-
-    // Wait for any task to complete, then abort the rest
-    tokio::select! {
-        _ = &mut pty_reader_handle => {
-            tracing::info!("PTY reader completed for terminal {}", pid);
-        }
-        _ = &mut output_handler => {
-            tracing::info!("Output handler completed for terminal {}", pid);
-        }
-        _ = &mut ws_to_pty => {
-            tracing::info!("WebSocket input handler completed for terminal {}", pid);
         }
     }
 
-    pty_reader_handle.abort();
-    output_handler.abort();
-    ws_to_pty.abort();
+    // Disconnect: clear the output sender so background reader stops forwarding
+    {
+        let mut guard = output_tx_arc.lock().unwrap();
+        *guard = None;
+    }
 
-    ws_connected.store(false, Ordering::Release);
-    tracing::info!(
-        "WebSocket disconnected for terminal {}, buffering to file",
-        pid
-    );
+    drop(ws_input_tx);
+    let _ = write_handle.await;
+
+    tracing::info!("WebSocket disconnected for terminal {}", pid);
 }
 
 pub async fn terminate_terminal(
@@ -413,7 +406,6 @@ pub async fn terminate_terminal(
             .map_err(|e| e.to_string());
 
         drop(session.writer.lock().await);
-        drop(session.reader.lock().await);
         session.scrollback.cleanup();
 
         match result {
