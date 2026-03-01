@@ -1,5 +1,5 @@
-mod buffer;
 mod handlers;
+mod scrollback;
 mod types;
 
 use axum::{
@@ -8,17 +8,15 @@ use axum::{
 };
 
 use axum::http::HeaderValue;
+use dashmap::DashMap;
 use std::sync::OnceLock;
-use std::{collections::HashMap, sync::Arc};
-use std::{io::ErrorKind, net::Ipv4Addr};
-use tokio::sync::Mutex;
+use std::{io::ErrorKind, net::Ipv4Addr, sync::Arc};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use handlers::*;
-
-pub type Sessions = Arc<Mutex<HashMap<u32, TerminalSession>>>;
+use types::Sessions;
 
 static DEFAULT_COMMAND: OnceLock<String> = OnceLock::new();
 
@@ -39,7 +37,8 @@ pub async fn start_server(host: Ipv4Addr, port: u16, allow_any_origin: bool) {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
-    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+
+    let sessions: Sessions = Arc::new(DashMap::new());
 
     let cors = if allow_any_origin {
         CorsLayer::new()
@@ -47,7 +46,6 @@ pub async fn start_server(host: Ipv4Addr, port: u16, allow_any_origin: bool) {
             .allow_methods(Any)
             .allow_headers(Any)
     } else {
-        // Only allow your Cordova app origin by default
         let localhost = "https://localhost"
             .parse::<HeaderValue>()
             .expect("valid origin");

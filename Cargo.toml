@@ -21,8 +21,9 @@ serde = { version = "1.0.215", features = ["derive"] }
 serde_json = "1.0.133"
 tokio = { version = "1.42.0", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
-bytes = "1.5"
+dashmap = "6"
 nom = "7.1"
+bytes = "1.5"
 tower-http = { version = "0.6.2", features = ["cors", "trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }

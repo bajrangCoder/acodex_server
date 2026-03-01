@@ -1,9 +1,9 @@
 use super::handlers::TerminalSession;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::Mutex;
+use std::sync::Arc;
 
-pub const MAX_BUFFER_SIZE: usize = 1_000_000;
+pub const MAX_SCROLLBACK_BYTES: usize = 262_144; // 256 KB
 
 #[derive(Deserialize)]
 pub struct TerminalOptions {
@@ -36,4 +36,4 @@ pub struct ProcessExitMessage {
     pub message: String,
 }
 
-pub type Sessions = Arc<Mutex<HashMap<u32, TerminalSession>>>;
+pub type Sessions = Arc<DashMap<u32, TerminalSession>>;
