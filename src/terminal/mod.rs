@@ -1,4 +1,5 @@
 mod handlers;
+mod pty_fallback;
 mod scrollback;
 mod types;
 
