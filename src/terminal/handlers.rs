@@ -1,5 +1,5 @@
-use super::buffer::CircularBuffer;
 use super::get_default_command;
+use super::scrollback::Scrollback;
 use super::types::*;
 use crate::utils::parse_u16;
 use axum::{
@@ -12,7 +12,7 @@ use axum::{
     Json,
 };
 use futures::{SinkExt, StreamExt};
-use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use regex::Regex;
 use std::io::Write;
 use std::time::SystemTime;
@@ -28,10 +28,11 @@ use tokio::task::spawn_blocking;
 pub struct TerminalSession {
     pub master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     pub child_killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
-    pub child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
-    pub reader: Arc<Mutex<Box<dyn Read + Send>>>,
     pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    pub buffer: Arc<Mutex<CircularBuffer>>,
+    pub scrollback: Arc<Scrollback>,
+    pub output_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>>,
+    pub exit_status: Arc<std::sync::Mutex<Option<bool>>>,
+    pub exit_notify: Arc<tokio::sync::Notify>,
     pub last_accessed: Arc<Mutex<SystemTime>>,
 }
 
@@ -45,7 +46,6 @@ pub async fn create_terminal(
 
     let pty_system = native_pty_system();
 
-    // Determine the command to run for the interactive PTY
     let mut program = String::from("login");
     let mut args: Vec<String> = Vec::new();
     if let Some(cmd) = get_default_command() {
@@ -76,24 +76,80 @@ pub async fn create_terminal(
                 Ok(child) => {
                     let pid = child.process_id().unwrap_or(0);
                     tracing::info!("Terminal created successfully with PID: {}", pid);
-                    drop(pair.slave); // Release slave after spawning
+                    drop(pair.slave);
 
-                    let reader = Arc::new(Mutex::new(pair.master.try_clone_reader().unwrap()));
+                    let reader = pair.master.try_clone_reader().unwrap();
                     let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
                     let master = Arc::new(Mutex::new(pair.master as Box<dyn MasterPty + Send>));
                     let child_killer = Arc::new(Mutex::new(child.clone_killer()));
 
+                    let scrollback = Arc::new(Scrollback::new(pid));
+                    let output_tx: Arc<
+                        std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
+                    > = Arc::new(std::sync::Mutex::new(None));
+                    let exit_status: Arc<std::sync::Mutex<Option<bool>>> =
+                        Arc::new(std::sync::Mutex::new(None));
+                    let exit_notify = Arc::new(tokio::sync::Notify::new());
+
+                    // Background PTY reader — runs for the session lifetime
+                    {
+                        let scrollback = scrollback.clone();
+                        let output_tx = output_tx.clone();
+                        spawn_blocking(move || {
+                            let mut reader = reader;
+                            let mut read_buffer = [0u8; 8192];
+                            loop {
+                                let n = match reader.read(&mut read_buffer) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => break,
+                                };
+
+                                let data = &read_buffer[..n];
+                                let _ = scrollback.append(data);
+
+                                if let Ok(guard) = output_tx.try_lock() {
+                                    if let Some(ref tx) = *guard {
+                                        let _ = tx.try_send(data.to_vec());
+                                    }
+                                }
+                            }
+                            tracing::info!("Background PTY reader exited for PID {}", pid);
+                        });
+                    }
+
+                    // Background child waiter — signals when process exits
+                    {
+                        let exit_status = exit_status.clone();
+                        let exit_notify = exit_notify.clone();
+                        let child = Arc::new(std::sync::Mutex::new(child));
+                        spawn_blocking(move || {
+                            let mut child_guard = child.lock().unwrap();
+                            let success = match child_guard.wait() {
+                                Ok(status) => status.success(),
+                                Err(_) => false,
+                            };
+                            *exit_status.lock().unwrap() = Some(success);
+                            exit_notify.notify_waiters();
+                            tracing::info!(
+                                "Background child waiter exited for PID {} (success={})",
+                                pid,
+                                success
+                            );
+                        });
+                    }
+
                     let session = TerminalSession {
                         master,
                         child_killer,
-                        child: Arc::new(Mutex::new(child)),
-                        reader,
                         writer,
-                        buffer: Arc::new(Mutex::new(CircularBuffer::new(MAX_BUFFER_SIZE))),
+                        scrollback,
+                        output_tx,
+                        exit_status,
+                        exit_notify,
                         last_accessed: Arc::new(Mutex::new(SystemTime::now())),
                     };
 
-                    sessions.lock().await.insert(pid, session);
+                    sessions.insert(pid, session);
                     (axum::http::StatusCode::OK, pid.to_string()).into_response()
                 }
                 Err(e) => {
@@ -123,8 +179,8 @@ pub async fn resize_terminal(
     let rows = parse_u16(&options.rows, "rows").expect("Failed");
     let cols = parse_u16(&options.cols, "cols").expect("Failed");
     tracing::info!("Resizing terminal {} to cols={}, rows={}", pid, cols, rows);
-    let mut sessions = sessions.lock().await;
-    if let Some(session) = sessions.get_mut(&pid) {
+
+    if let Some(session) = sessions.get(&pid) {
         let size = PtySize {
             rows,
             cols,
@@ -159,178 +215,180 @@ pub async fn terminal_websocket(
 async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
     let (mut sender, mut receiver) = socket.split();
 
-    let session_lock = sessions.lock().await;
-    if let Some(session) = session_lock.get(&pid) {
-        // Update last accessed time
-        let mut last_accessed = session.last_accessed.lock().await;
-        *last_accessed = SystemTime::now();
-        drop(last_accessed);
-
-        tracing::info!("WebSocket connection established for terminal {}", pid);
-        let reader = session.reader.clone();
-        let writer = session.writer.clone();
-        let buffer = session.buffer.clone();
-        let child = session.child.clone();
-        drop(session_lock);
-
-        // Send initial buffer contents
-        let buffer_guard = buffer.lock().await;
-        let contents = buffer_guard.get_contents();
-        if !contents.is_empty() {
-            let _ = sender.send(Message::Binary(contents)).await;
-        }
-        drop(buffer_guard);
-
-        // Create channels for communication
-        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
-        let (exit_tx, mut exit_rx) = tokio::sync::mpsc::channel::<portable_pty::ExitStatus>(1);
-
-        let pty_to_ws = {
-            let reader = reader.clone();
-            let child = child.clone();
-
-            tokio::spawn(async move {
-                // Spawn read task
-                let read_task = spawn_blocking({
-                    let reader = reader.clone();
-                    let output_tx = output_tx.clone();
-                    move || {
-                        let mut read_buffer = [0u8; 1024];
-                        loop {
-                            let n = {
-                                let mut reader_guard = reader.blocking_lock();
-                                match reader_guard.read(&mut read_buffer) {
-                                    Ok(n) if n > 0 => n,
-                                    _ => break,
-                                }
-                            };
-
-                            let data = read_buffer[..n].to_vec();
-                            if output_tx.blocking_send(data).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                });
-
-                // Spawn wait task
-                let wait_task = spawn_blocking({
-                    let child = child.clone();
-                    let exit_tx = exit_tx.clone();
-                    move || {
-                        let mut child_guard = child.blocking_lock();
-                        if let Ok(exit_status) = child_guard.wait() {
-                            let _ = exit_tx.blocking_send(exit_status);
-                        }
-                    }
-                });
-
-                // Wait for tasks to complete
-                let _ = tokio::join!(read_task, wait_task);
-            })
+    let (writer, scrollback, output_tx_arc, exit_status_arc, exit_notify) = {
+        let Some(session) = sessions.get(&pid) else {
+            tracing::error!("Session {} not found", pid);
+            return;
         };
 
-        // Handle output and exit events
-        let output_handler = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    data = output_rx.recv() => {
-                        if let Some(data) = data {
-                            let mut buffer_guard = buffer.lock().await;
-                            buffer_guard.write(&data);
-                            drop(buffer_guard);
+        *session.last_accessed.lock().await = SystemTime::now();
+        tracing::info!("WebSocket connection established for terminal {}", pid);
 
-                            if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    exit_status = exit_rx.recv() => {
-                        if let Some(exit_status) = exit_status {
-                            let exit_message = if exit_status.success() {
-                                ProcessExitMessage {
-                                    exit_code: Some(0),
-                                    signal: None,
-                                    message: "Process exited successfully".to_string(),
-                                }
-                            } else {
-                                ProcessExitMessage {
-                                    exit_code: Some(1),
-                                    signal: None,
-                                    message: "Process exited with non-zero status".to_string(),
-                                }
-                            };
+        (
+            session.writer.clone(),
+            session.scrollback.clone(),
+            session.output_tx.clone(),
+            session.exit_status.clone(),
+            session.exit_notify.clone(),
+        )
+    };
 
-                            // Send exit message to WebSocket
-                            let exit_json = serde_json::to_string(&exit_message).unwrap_or_else(|_|
-                                "{\"exit_code\":1,\"signal\":null,\"message\":\"Process exited\"}".to_string()
-                            );
+    // Check if process already exited
+    let already_exited = {
+        let guard = exit_status_arc.lock().unwrap();
+        *guard
+    };
+    if let Some(success) = already_exited {
+        let exit_message = ProcessExitMessage {
+            exit_code: Some(if success { 0 } else { 1 }),
+            signal: None,
+            message: if success {
+                "Process exited successfully"
+            } else {
+                "Process exited with non-zero status"
+            }
+            .to_string(),
+        };
+        let exit_json = serde_json::to_string(&exit_message).unwrap_or_default();
+        let _ = sender
+            .send(Message::Text(
+                format!("{{\"type\":\"exit\",\"data\":{exit_json}}}").into(),
+            ))
+            .await;
+        sessions.remove(&pid);
+        return;
+    }
 
-                            let _ = sender.send(Message::Text(format!("{{\"type\":\"exit\",\"data\":{exit_json}}}").into())).await;
+    // Create output channel for this WS connection
+    let (ws_output_tx, mut ws_output_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
 
-                            // Remove session from sessions map
-                            let mut sessions_guard = sessions.lock().await;
-                            sessions_guard.remove(&pid);
-                            break;
-                        }
-                    }
+    // Set the sender so background reader starts forwarding to us
+    {
+        let mut guard = output_tx_arc.lock().unwrap();
+        *guard = Some(ws_output_tx);
+    }
+
+    // Send full scrollback history (client should clear terminal before connecting)
+    let scrollback_for_replay = scrollback.clone();
+    match spawn_blocking(move || scrollback_for_replay.read_tail(MAX_SCROLLBACK_BYTES)).await {
+        Ok(Ok(contents)) if !contents.is_empty() => {
+            let _ = sender.send(Message::Binary(Bytes::from(contents))).await;
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("Failed to read scrollback for terminal {}: {}", pid, e);
+        }
+        _ => {}
+    }
+
+    // WS input → PTY writer channel
+    let (ws_input_tx, ws_input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let write_handle = {
+        let writer = writer.clone();
+        spawn_blocking(move || {
+            while let Ok(data) = ws_input_rx.recv() {
+                let mut guard = writer.blocking_lock();
+                if guard.write_all(&data).is_err() || guard.flush().is_err() {
+                    break;
                 }
             }
-        });
+        })
+    };
 
-        // Handle WebSocket input to PTY
-        let ws_to_pty = {
-            let writer = writer.clone();
-            tokio::spawn(async move {
-                let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-                let tx = std::sync::Arc::new(tx);
-                let tx_clone = tx.clone();
+    // Main loop with output coalescing
+    let mut coalesce_buf: Vec<u8> = Vec::with_capacity(16384);
+    let mut interval = tokio::time::interval(Duration::from_millis(8));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-                let write_handle = spawn_blocking(move || {
-                    while let Ok(data) = rx.recv() {
-                        let mut writer_guard = writer.blocking_lock();
-                        if writer_guard.write_all(&data).is_err() || writer_guard.flush().is_err() {
-                            break;
-                        }
-                    }
-                });
-
-                while let Some(Ok(message)) = receiver.next().await {
-                    let data: axum::body::Bytes = match message {
-                        Message::Text(text) => Bytes::from(text),
-                        Message::Binary(data) => data,
-                        Message::Close(_) => break,
-                        _ => continue,
-                    };
-
-                    if tx_clone.send(data.to_vec()).is_err() {
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                if !coalesce_buf.is_empty() {
+                    let frame = std::mem::replace(&mut coalesce_buf, Vec::with_capacity(16384));
+                    if sender.send(Message::Binary(Bytes::from(frame))).await.is_err() {
                         break;
                     }
                 }
-
-                // Clean up
-                drop(tx_clone);
-                let _ = write_handle.await;
-            })
-        };
-
-        // Wait for any task to complete
-        tokio::select! {
-            _ = pty_to_ws => {
-                tracing::info!("PTY to WebSocket task completed for terminal {}", pid);
             }
-            _ = output_handler => {
-                tracing::info!("Output handler completed for terminal {}", pid);
+            data = ws_output_rx.recv() => {
+                match data {
+                    Some(data) => {
+                        coalesce_buf.extend_from_slice(&data);
+                        if coalesce_buf.len() >= 8192 {
+                            let frame = std::mem::replace(&mut coalesce_buf, Vec::with_capacity(16384));
+                            if sender.send(Message::Binary(Bytes::from(frame))).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        if !coalesce_buf.is_empty() {
+                            let _ = sender.send(Message::Binary(Bytes::from(std::mem::take(&mut coalesce_buf)))).await;
+                        }
+                        break;
+                    }
+                }
             }
-            _ = ws_to_pty => {
-                tracing::info!("WebSocket to PTY task completed for terminal {}", pid);
+            _ = exit_notify.notified() => {
+                // Give the reader a moment to flush remaining output
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                while let Ok(data) = ws_output_rx.try_recv() {
+                    coalesce_buf.extend_from_slice(&data);
+                }
+                if !coalesce_buf.is_empty() {
+                    let _ = sender.send(Message::Binary(Bytes::from(std::mem::take(&mut coalesce_buf)))).await;
+                }
+
+                let success = exit_status_arc.lock().unwrap().unwrap_or(false);
+                let exit_message = ProcessExitMessage {
+                    exit_code: Some(if success { 0 } else { 1 }),
+                    signal: None,
+                    message: if success {
+                        "Process exited successfully"
+                    } else {
+                        "Process exited with non-zero status"
+                    }
+                    .to_string(),
+                };
+                let exit_json = serde_json::to_string(&exit_message).unwrap_or_default();
+                let _ = sender
+                    .send(Message::Text(
+                        format!("{{\"type\":\"exit\",\"data\":{exit_json}}}").into(),
+                    ))
+                    .await;
+
+                sessions.remove(&pid);
+                break;
+            }
+            msg = receiver.next() => {
+                match msg {
+                    Some(Ok(message)) => {
+                        let data = match message {
+                            Message::Text(text) => text.as_bytes().to_vec(),
+                            Message::Binary(data) => data.to_vec(),
+                            Message::Close(_) => break,
+                            _ => continue,
+                        };
+                        if ws_input_tx.send(data).is_err() {
+                            break;
+                        }
+                    }
+                    None | Some(Err(_)) => break,
+                }
             }
         }
-    } else {
-        tracing::error!("Session {} not found", pid);
     }
+
+    // Disconnect: clear the output sender so background reader stops forwarding
+    {
+        let mut guard = output_tx_arc.lock().unwrap();
+        *guard = None;
+    }
+
+    drop(ws_input_tx);
+    let _ = write_handle.await;
+
+    tracing::info!("WebSocket disconnected for terminal {}", pid);
 }
 
 pub async fn terminate_terminal(
@@ -338,24 +396,17 @@ pub async fn terminate_terminal(
     Path(pid): Path<u32>,
 ) -> impl IntoResponse {
     tracing::info!("Terminating terminal {}", pid);
-    let mut sessions = sessions.lock().await;
 
-    if let Some(session) = sessions.remove(&pid) {
-        let result = {
-            session
-                .child_killer
-                .lock()
-                .await
-                .kill()
-                .map_err(|e| e.to_string())
-        };
+    if let Some((_, session)) = sessions.remove(&pid) {
+        let result = session
+            .child_killer
+            .lock()
+            .await
+            .kill()
+            .map_err(|e| e.to_string());
+
         drop(session.writer.lock().await);
-        drop(session.reader.lock().await);
-
-        // Clear the circular buffer
-        if let Ok(mut buffer) = session.buffer.try_lock() {
-            buffer.data.clear();
-        }
+        session.scrollback.cleanup();
 
         match result {
             Ok(_) => {
@@ -388,7 +439,6 @@ pub async fn execute_command(Json(options): Json<ExecuteCommandOption>) -> impl 
         "Executing command"
     );
 
-    // Use a POSIX shell to execute non-interactive commands
     let shell = String::from("sh");
     let cwd = if cwd.is_empty() {
         std::env::var("HOME")
@@ -411,9 +461,7 @@ pub async fn execute_command(Json(options): Json<ExecuteCommandOption>) -> impl 
 
     let command = options.command.clone();
 
-    // Execute command in a blocking task
     let result = spawn_blocking(move || {
-        // Set up PTY
         let pty_system = native_pty_system();
         let size = PtySize {
             rows: 24,
@@ -424,27 +472,23 @@ pub async fn execute_command(Json(options): Json<ExecuteCommandOption>) -> impl 
 
         let pair = pty_system.openpty(size)?;
 
-        // Set up command
         let mut cmd = CommandBuilder::new(shell);
         cmd.args(["-c", &command]);
         cmd.cwd(cwd);
 
-        // Spawn the command
         let mut child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
 
-        // Create channel for reading output
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
-        // Spawn a thread for reading
         let read_thread = std::thread::spawn(move || {
-            let mut buffer = [0u8; 1024];
+            let mut buffer = [0u8; 8192];
             loop {
                 match reader.read(&mut buffer) {
-                    Ok(0) => break, // EOF
+                    Ok(0) => break,
                     Ok(n) => {
                         if tx.send(buffer[..n].to_vec()).is_err() {
                             break;
@@ -455,7 +499,6 @@ pub async fn execute_command(Json(options): Json<ExecuteCommandOption>) -> impl 
             }
         });
 
-        // Collect output with timeout
         let timeout_duration = Duration::from_secs(30);
         let start_time = SystemTime::now();
         let mut output = Vec::new();
@@ -474,13 +517,11 @@ pub async fn execute_command(Json(options): Json<ExecuteCommandOption>) -> impl 
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
 
-            // Check if process has finished
             if let Ok(Some(_)) = child.try_wait() {
                 break;
             }
         }
 
-        // Clean up resources
         drop(writer);
         let _ = read_thread.join();
         child.wait()?;
@@ -489,12 +530,10 @@ pub async fn execute_command(Json(options): Json<ExecuteCommandOption>) -> impl 
     })
     .await;
 
-    // Process the result
     match result {
         Ok(Ok(output)) => {
             let output_str = String::from_utf8_lossy(&output).into_owned();
 
-            // Clean ANSI escape sequences
             let ansi_regex =
                 Regex::new(r"\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]|\x1B\[[0-9]+[A-Za-z]").unwrap();
             let cleaned_output = ansi_regex.replace_all(&output_str, "").to_string();
