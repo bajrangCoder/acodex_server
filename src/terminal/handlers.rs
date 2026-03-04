@@ -105,9 +105,7 @@ pub async fn create_terminal(
                 Err(fb_err) => {
                     tracing::error!("TIOCGPTPEER fallback also failed: {}", fb_err);
                     return Json(ErrorResponse {
-                        error: format!(
-                            "Failed to open PTY: {e}; TIOCGPTPEER fallback: {fb_err}"
-                        ),
+                        error: format!("Failed to open PTY: {e}; TIOCGPTPEER fallback: {fb_err}"),
                     })
                     .into_response();
                 }
@@ -145,8 +143,7 @@ pub async fn create_terminal(
     let scrollback = Arc::new(Scrollback::new(pid));
     let output_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>> =
         Arc::new(std::sync::Mutex::new(None));
-    let exit_status: Arc<std::sync::Mutex<Option<bool>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let exit_status: Arc<std::sync::Mutex<Option<bool>>> = Arc::new(std::sync::Mutex::new(None));
     let exit_notify = Arc::new(tokio::sync::Notify::new());
 
     // Background PTY reader — runs for the session lifetime

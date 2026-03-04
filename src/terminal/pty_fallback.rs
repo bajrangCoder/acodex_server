@@ -32,7 +32,9 @@ impl OwnedFd {
         let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
         if rc < 0 {
             let err = io::Error::last_os_error();
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(err);
         }
         Ok(OwnedFd(fd))
@@ -114,26 +116,24 @@ impl MasterPty for FallbackMasterPty {
             ws_xpixel: size.pixel_width,
             ws_ypixel: size.pixel_height,
         };
-        if unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::TIOCSWINSZ as _, &ws as *const _) }
-            != 0
+        if unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::TIOCSWINSZ as _, &ws as *const _) } != 0
         {
-            bail!(
-                "ioctl(TIOCSWINSZ) failed: {:?}",
-                io::Error::last_os_error()
-            );
+            bail!("ioctl(TIOCSWINSZ) failed: {:?}", io::Error::last_os_error());
         }
         Ok(())
     }
 
     fn get_size(&self) -> Result<PtySize, Error> {
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        if unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::TIOCGWINSZ as _, &mut ws as *mut _) }
-            != 0
+        if unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                libc::TIOCGWINSZ as _,
+                &mut ws as *mut _,
+            )
+        } != 0
         {
-            bail!(
-                "ioctl(TIOCGWINSZ) failed: {:?}",
-                io::Error::last_os_error()
-            );
+            bail!("ioctl(TIOCGWINSZ) failed: {:?}", io::Error::last_os_error());
         }
         Ok(PtySize {
             rows: ws.ws_row,
@@ -217,12 +217,7 @@ unsafe fn close_fds_above_stderr() {
     // Try close_range(3, UINT_MAX, 0) first (Linux 5.9+).
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        let res = libc::syscall(
-            libc::SYS_close_range,
-            3u64,
-            u32::MAX as u64,
-            0u64,
-        );
+        let res = libc::syscall(libc::SYS_close_range, 3u64, u32::MAX as u64, 0u64);
         if res == 0 {
             return;
         }
@@ -260,17 +255,9 @@ pub fn fallback_open_and_spawn(
     use std::os::unix::process::CommandExt;
 
     // 1. Open master PTY
-    let master_fd = unsafe {
-        libc::open(
-            c"/dev/ptmx".as_ptr(),
-            libc::O_RDWR | libc::O_CLOEXEC,
-        )
-    };
+    let master_fd = unsafe { libc::open(c"/dev/ptmx".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if master_fd < 0 {
-        bail!(
-            "open(/dev/ptmx) failed: {:?}",
-            io::Error::last_os_error()
-        );
+        bail!("open(/dev/ptmx) failed: {:?}", io::Error::last_os_error());
     }
     let master = OwnedFd(master_fd);
 
@@ -305,14 +292,7 @@ pub fn fallback_open_and_spawn(
         ws_xpixel: size.pixel_width,
         ws_ypixel: size.pixel_height,
     };
-    if unsafe {
-        libc::ioctl(
-            master.as_raw_fd(),
-            libc::TIOCSWINSZ as _,
-            &ws as *const _,
-        )
-    } == -1
-    {
+    if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ as _, &ws as *const _) } == -1 {
         tracing::warn!(
             "ioctl(TIOCSWINSZ) failed (non-fatal): {:?}",
             io::Error::last_os_error()
@@ -327,10 +307,7 @@ pub fn fallback_open_and_spawn(
         let mk_stdio = || -> anyhow::Result<std::process::Stdio> {
             let fd = unsafe { libc::dup(slave.as_raw_fd()) };
             if fd < 0 {
-                bail!(
-                    "dup(slave_fd) failed: {:?}",
-                    io::Error::last_os_error()
-                );
+                bail!("dup(slave_fd) failed: {:?}", io::Error::last_os_error());
             }
             Ok(unsafe { std::process::Stdio::from_raw_fd(fd) })
         };
