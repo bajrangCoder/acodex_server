@@ -262,7 +262,7 @@ pub fn fallback_open_and_spawn(
     // 1. Open master PTY
     let master_fd = unsafe {
         libc::open(
-            b"/dev/ptmx\0".as_ptr() as *const _,
+            c"/dev/ptmx".as_ptr(),
             libc::O_RDWR | libc::O_CLOEXEC,
         )
     };
