@@ -28,6 +28,13 @@ impl OwnedFd {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // Set CLOEXEC so cloned fds don't leak into spawned child processes.
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            unsafe { libc::close(fd); }
+            return Err(err);
+        }
         Ok(OwnedFd(fd))
     }
 }
@@ -48,25 +55,34 @@ impl Drop for OwnedFd {
 
 impl Read for OwnedFd {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut _, buf.len()) };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EIO) {
-                return Ok(0); // slave closed → EOF
+        loop {
+            let n = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    Some(libc::EIO) => return Ok(0), // slave closed → EOF
+                    _ => return Err(err),
+                }
             }
-            return Err(err);
+            return Ok(n as usize);
         }
-        Ok(n as usize)
     }
 }
 
 impl Write for OwnedFd {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = unsafe { libc::write(self.0, buf.as_ptr() as *const _, buf.len()) };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
+        loop {
+            let n = unsafe { libc::write(self.0, buf.as_ptr() as *const _, buf.len()) };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    _ => return Err(err),
+                }
+            }
+            return Ok(n as usize);
         }
-        Ok(n as usize)
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -192,16 +208,39 @@ impl Drop for FallbackMasterWriter {
 // Helper: close leaked fds in the child process
 // ---------------------------------------------------------------------------
 
+/// Close all fds above stderr in the child process.
+///
+/// This runs inside `pre_exec` (between `fork()` and `exec()`), so it MUST
+/// only use async-signal-safe operations — no heap allocation, no Rust
+/// stdlib I/O, no iterators that allocate.
 unsafe fn close_fds_above_stderr() {
-    if let Ok(dir) = std::fs::read_dir("/dev/fd") {
-        let fds: Vec<RawFd> = dir
-            .filter_map(|e| e.ok())
-            .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse().ok()))
-            .filter(|&fd| fd > 2)
-            .collect();
-        for fd in fds {
-            libc::close(fd);
+    // Try close_range(3, UINT_MAX, 0) first (Linux 5.9+).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let res = libc::syscall(
+            libc::SYS_close_range,
+            3u64,
+            u32::MAX as u64,
+            0u64,
+        );
+        if res == 0 {
+            return;
         }
+    }
+
+    // Fallback: close(3..RLIMIT_NOFILE) loop — no allocation needed.
+    let mut rl: libc::rlimit = std::mem::zeroed();
+    let max_fd: libc::rlim_t = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0
+        && rl.rlim_cur != libc::RLIM_INFINITY
+    {
+        rl.rlim_cur
+    } else {
+        1024
+    };
+    let mut fd: libc::c_int = 3;
+    while (fd as libc::rlim_t) < max_fd {
+        libc::close(fd);
+        fd += 1;
     }
 }
 
@@ -258,40 +297,49 @@ pub fn fallback_open_and_spawn(
         );
     }
 
-    // 4. Set window size
+    // 4. Set window size (non-fatal — the first resize from the client will
+    //    correct it anyway, so we only log on failure rather than aborting).
     let ws = libc::winsize {
         ws_row: size.rows,
         ws_col: size.cols,
         ws_xpixel: size.pixel_width,
         ws_ypixel: size.pixel_height,
     };
-    unsafe {
+    if unsafe {
         libc::ioctl(
             master.as_raw_fd(),
             libc::TIOCSWINSZ as _,
             &ws as *const _,
+        )
+    } == -1
+    {
+        tracing::warn!(
+            "ioctl(TIOCSWINSZ) failed (non-fatal): {:?}",
+            io::Error::last_os_error()
         );
     }
 
-    // 5. Prepare Stdio from slave fd (one dup per stream)
-    let mk_stdio = || -> anyhow::Result<std::process::Stdio> {
-        let fd = unsafe { libc::dup(slave_fd) };
-        if fd < 0 {
-            bail!(
-                "dup(slave_fd) failed: {:?}",
-                io::Error::last_os_error()
-            );
-        }
-        Ok(unsafe { std::process::Stdio::from_raw_fd(fd) })
+    // 5. Prepare Stdio from slave fd (one dup per stream).
+    //    Wrap slave_fd in OwnedFd so it is closed on all paths
+    //    (including early ? returns from mk_stdio).
+    let (child_stdin, child_stdout, child_stderr) = {
+        let slave = OwnedFd(slave_fd);
+        let mk_stdio = || -> anyhow::Result<std::process::Stdio> {
+            let fd = unsafe { libc::dup(slave.as_raw_fd()) };
+            if fd < 0 {
+                bail!(
+                    "dup(slave_fd) failed: {:?}",
+                    io::Error::last_os_error()
+                );
+            }
+            Ok(unsafe { std::process::Stdio::from_raw_fd(fd) })
+        };
+        let stdin = mk_stdio()?;
+        let stdout = mk_stdio()?;
+        let stderr = mk_stdio()?;
+        (stdin, stdout, stderr)
+        // `slave` (OwnedFd) is dropped here, closing the original slave_fd.
     };
-    let child_stdin = mk_stdio()?;
-    let child_stdout = mk_stdio()?;
-    let child_stderr = mk_stdio()?;
-
-    // Close original slave fd — the dups are owned by Stdio now
-    unsafe {
-        libc::close(slave_fd);
-    }
 
     // 6. Spawn command
     let mut cmd = std::process::Command::new(program);

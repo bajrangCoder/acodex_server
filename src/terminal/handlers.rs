@@ -66,17 +66,33 @@ pub async fn create_terminal(
 
     // --- Try the standard portable-pty path first ---
     let pty_system = native_pty_system();
-    let std_result = pty_system.openpty(size).and_then(|pair| {
-        let mut cmd = CommandBuilder::new(&program);
-        if !args.is_empty() {
-            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            cmd.args(arg_refs);
-        }
-        let child = pair.slave.spawn_command(cmd)?;
-        Ok((pair.master, child))
-    });
+    let openpty_result = pty_system.openpty(size);
 
-    // --- If standard path fails, fall back to TIOCGPTPEER ---
+    let std_result = match openpty_result {
+        Ok(pair) => {
+            let mut cmd = CommandBuilder::new(&program);
+            if !args.is_empty() {
+                let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                cmd.args(arg_refs);
+            }
+            match pair.slave.spawn_command(cmd) {
+                Ok(child) => Ok((pair.master, child)),
+                Err(e) => {
+                    // openpty succeeded but spawn failed — this is a command
+                    // error (e.g. missing program), not a PTY capability issue.
+                    // Do NOT fall back; report immediately.
+                    tracing::error!("spawn_command failed: {}", e);
+                    return Json(ErrorResponse {
+                        error: format!("Failed to spawn command: {e}"),
+                    })
+                    .into_response();
+                }
+            }
+        }
+        Err(e) => Err(e),
+    };
+
+    // --- If openpty itself failed, fall back to TIOCGPTPEER ---
     let (master, child) = match std_result {
         Ok(pair) => pair,
         Err(e) => {
