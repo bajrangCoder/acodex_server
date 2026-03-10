@@ -93,7 +93,7 @@ pub async fn create_terminal(
     };
 
     // --- If openpty itself failed, fall back to TIOCGPTPEER ---
-    let (master, child) = match std_result {
+    let (master, mut child) = match std_result {
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!(
@@ -121,6 +121,8 @@ pub async fn create_terminal(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("Failed to clone PTY reader: {}", e);
+            let _ = child.kill();
+            let _ = child.wait();
             return Json(ErrorResponse {
                 error: format!("Failed to clone PTY reader: {e}"),
             })
@@ -131,6 +133,8 @@ pub async fn create_terminal(
         Ok(w) => Arc::new(Mutex::new(w)),
         Err(e) => {
             tracing::error!("Failed to take PTY writer: {}", e);
+            let _ = child.kill();
+            let _ = child.wait();
             return Json(ErrorResponse {
                 error: format!("Failed to take PTY writer: {e}"),
             })

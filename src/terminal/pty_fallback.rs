@@ -214,6 +214,8 @@ impl Drop for FallbackMasterWriter {
 /// only use async-signal-safe operations — no heap allocation, no Rust
 /// stdlib I/O, no iterators that allocate.
 unsafe fn close_fds_above_stderr() {
+    const FALLBACK_MAX_FD: libc::c_int = 1_048_576;
+
     // Try close_range(3, UINT_MAX, 0) first (Linux 5.9+).
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -225,15 +227,19 @@ unsafe fn close_fds_above_stderr() {
 
     // Fallback: close(3..RLIMIT_NOFILE) loop — no allocation needed.
     let mut rl: libc::rlimit = std::mem::zeroed();
-    let max_fd: libc::rlim_t = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0
-        && rl.rlim_cur != libc::RLIM_INFINITY
-    {
-        rl.rlim_cur
+    let max_fd = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+        if rl.rlim_cur != libc::RLIM_INFINITY {
+            rl.rlim_cur.min(libc::c_int::MAX as libc::rlim_t) as libc::c_int
+        } else if rl.rlim_max != libc::RLIM_INFINITY {
+            rl.rlim_max.min(libc::c_int::MAX as libc::rlim_t) as libc::c_int
+        } else {
+            FALLBACK_MAX_FD
+        }
     } else {
-        1024
+        FALLBACK_MAX_FD
     };
     let mut fd: libc::c_int = 3;
-    while (fd as libc::rlim_t) < max_fd {
+    while fd < max_fd {
         libc::close(fd);
         fd += 1;
     }
