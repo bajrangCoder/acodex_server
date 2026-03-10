@@ -1,4 +1,5 @@
 use super::get_default_command;
+use super::pty_fallback::fallback_open_and_spawn;
 use super::scrollback::Scrollback;
 use super::types::*;
 use crate::utils::parse_u16;
@@ -44,8 +45,6 @@ pub async fn create_terminal(
     let cols = parse_u16(&options.cols, "cols").expect("failed");
     tracing::info!("Creating new terminal with cols={}, rows={}", cols, rows);
 
-    let pty_system = native_pty_system();
-
     let mut program = String::from("login");
     let mut args: Vec<String> = Vec::new();
     if let Some(cmd) = get_default_command() {
@@ -65,110 +64,152 @@ pub async fn create_terminal(
         pixel_height: 0,
     };
 
-    match pty_system.openpty(size) {
+    // --- Try the standard portable-pty path first ---
+    let pty_system = native_pty_system();
+    let openpty_result = pty_system.openpty(size);
+
+    let std_result = match openpty_result {
         Ok(pair) => {
-            let mut cmd = CommandBuilder::new(program);
+            let mut cmd = CommandBuilder::new(&program);
             if !args.is_empty() {
                 let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                 cmd.args(arg_refs);
             }
             match pair.slave.spawn_command(cmd) {
-                Ok(child) => {
-                    let pid = child.process_id().unwrap_or(0);
-                    tracing::info!("Terminal created successfully with PID: {}", pid);
-                    drop(pair.slave);
-
-                    let reader = pair.master.try_clone_reader().unwrap();
-                    let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
-                    let master = Arc::new(Mutex::new(pair.master as Box<dyn MasterPty + Send>));
-                    let child_killer = Arc::new(Mutex::new(child.clone_killer()));
-
-                    let scrollback = Arc::new(Scrollback::new(pid));
-                    let output_tx: Arc<
-                        std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
-                    > = Arc::new(std::sync::Mutex::new(None));
-                    let exit_status: Arc<std::sync::Mutex<Option<bool>>> =
-                        Arc::new(std::sync::Mutex::new(None));
-                    let exit_notify = Arc::new(tokio::sync::Notify::new());
-
-                    // Background PTY reader — runs for the session lifetime
-                    {
-                        let scrollback = scrollback.clone();
-                        let output_tx = output_tx.clone();
-                        spawn_blocking(move || {
-                            let mut reader = reader;
-                            let mut read_buffer = [0u8; 8192];
-                            loop {
-                                let n = match reader.read(&mut read_buffer) {
-                                    Ok(n) if n > 0 => n,
-                                    _ => break,
-                                };
-
-                                let data = &read_buffer[..n];
-                                let _ = scrollback.append(data);
-
-                                if let Ok(guard) = output_tx.try_lock() {
-                                    if let Some(ref tx) = *guard {
-                                        let _ = tx.try_send(data.to_vec());
-                                    }
-                                }
-                            }
-                            tracing::info!("Background PTY reader exited for PID {}", pid);
-                        });
-                    }
-
-                    // Background child waiter — signals when process exits
-                    {
-                        let exit_status = exit_status.clone();
-                        let exit_notify = exit_notify.clone();
-                        let child = Arc::new(std::sync::Mutex::new(child));
-                        spawn_blocking(move || {
-                            let mut child_guard = child.lock().unwrap();
-                            let success = match child_guard.wait() {
-                                Ok(status) => status.success(),
-                                Err(_) => false,
-                            };
-                            *exit_status.lock().unwrap() = Some(success);
-                            exit_notify.notify_waiters();
-                            tracing::info!(
-                                "Background child waiter exited for PID {} (success={})",
-                                pid,
-                                success
-                            );
-                        });
-                    }
-
-                    let session = TerminalSession {
-                        master,
-                        child_killer,
-                        writer,
-                        scrollback,
-                        output_tx,
-                        exit_status,
-                        exit_notify,
-                        last_accessed: Arc::new(Mutex::new(SystemTime::now())),
-                    };
-
-                    sessions.insert(pid, session);
-                    (axum::http::StatusCode::OK, pid.to_string()).into_response()
-                }
+                Ok(child) => Ok((pair.master, child)),
                 Err(e) => {
-                    tracing::error!("Failed to spawn command: {}", e);
-                    Json(ErrorResponse {
+                    // openpty succeeded but spawn failed — this is a command
+                    // error (e.g. missing program), not a PTY capability issue.
+                    // Do NOT fall back; report immediately.
+                    tracing::error!("spawn_command failed: {}", e);
+                    return Json(ErrorResponse {
                         error: format!("Failed to spawn command: {e}"),
                     })
-                    .into_response()
+                    .into_response();
                 }
             }
         }
+        Err(e) => Err(e),
+    };
+
+    // --- If openpty itself failed, fall back to TIOCGPTPEER ---
+    let (master, mut child) = match std_result {
+        Ok(pair) => pair,
         Err(e) => {
-            tracing::error!("Failed to open PTY: {}", e);
-            Json(ErrorResponse {
-                error: format!("Failed to open PTY: {e}"),
-            })
-            .into_response()
+            tracing::warn!(
+                "Standard openpty failed ({}), trying TIOCGPTPEER fallback",
+                e
+            );
+            match fallback_open_and_spawn(size, &program, &args) {
+                Ok(pair) => pair,
+                Err(fb_err) => {
+                    tracing::error!("TIOCGPTPEER fallback also failed: {}", fb_err);
+                    return Json(ErrorResponse {
+                        error: format!("Failed to open PTY: {e}; TIOCGPTPEER fallback: {fb_err}"),
+                    })
+                    .into_response();
+                }
+            }
         }
+    };
+
+    // --- Common session setup ---
+    let pid = child.process_id().unwrap_or(0);
+    tracing::info!("Terminal created successfully with PID: {}", pid);
+
+    let reader = match master.try_clone_reader() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to clone PTY reader: {}", e);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Json(ErrorResponse {
+                error: format!("Failed to clone PTY reader: {e}"),
+            })
+            .into_response();
+        }
+    };
+    let writer = match master.take_writer() {
+        Ok(w) => Arc::new(Mutex::new(w)),
+        Err(e) => {
+            tracing::error!("Failed to take PTY writer: {}", e);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Json(ErrorResponse {
+                error: format!("Failed to take PTY writer: {e}"),
+            })
+            .into_response();
+        }
+    };
+    let master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(master));
+    let child_killer = Arc::new(Mutex::new(child.clone_killer()));
+
+    let scrollback = Arc::new(Scrollback::new(pid));
+    let output_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let exit_status: Arc<std::sync::Mutex<Option<bool>>> = Arc::new(std::sync::Mutex::new(None));
+    let exit_notify = Arc::new(tokio::sync::Notify::new());
+
+    // Background PTY reader — runs for the session lifetime
+    {
+        let scrollback = scrollback.clone();
+        let output_tx = output_tx.clone();
+        spawn_blocking(move || {
+            let mut reader = reader;
+            let mut read_buffer = [0u8; 8192];
+            loop {
+                let n = match reader.read(&mut read_buffer) {
+                    Ok(n) if n > 0 => n,
+                    _ => break,
+                };
+
+                let data = &read_buffer[..n];
+                let _ = scrollback.append(data);
+
+                if let Ok(guard) = output_tx.try_lock() {
+                    if let Some(ref tx) = *guard {
+                        let _ = tx.try_send(data.to_vec());
+                    }
+                }
+            }
+            tracing::info!("Background PTY reader exited for PID {}", pid);
+        });
     }
+
+    // Background child waiter — signals when process exits
+    {
+        let exit_status = exit_status.clone();
+        let exit_notify = exit_notify.clone();
+        let child = Arc::new(std::sync::Mutex::new(child));
+        spawn_blocking(move || {
+            let mut child_guard = child.lock().unwrap();
+            let success = match child_guard.wait() {
+                Ok(status) => status.success(),
+                Err(_) => false,
+            };
+            *exit_status.lock().unwrap() = Some(success);
+            exit_notify.notify_waiters();
+            tracing::info!(
+                "Background child waiter exited for PID {} (success={})",
+                pid,
+                success
+            );
+        });
+    }
+
+    let session = TerminalSession {
+        master,
+        child_killer,
+        writer,
+        scrollback,
+        output_tx,
+        exit_status,
+        exit_notify,
+        last_accessed: Arc::new(Mutex::new(SystemTime::now())),
+    };
+
+    sessions.insert(pid, session);
+    (axum::http::StatusCode::OK, pid.to_string()).into_response()
 }
 
 pub async fn resize_terminal(

@@ -1,4 +1,7 @@
 mod handlers;
+// Not gated with #[cfg(target_os)] — this crate exclusively targets
+// Linux/Android and will never be built for other platforms.
+mod pty_fallback;
 mod scrollback;
 mod types;
 
