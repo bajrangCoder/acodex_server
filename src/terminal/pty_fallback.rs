@@ -15,6 +15,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 /// Defined in `<linux/tty.h>` as `_IO('T', 0x41)` = `0x5441`.
 /// Architecture-independent on Linux.
 const TIOCGPTPEER: libc::c_ulong = 0x5441;
+const CLOSE_RANGE_CLOEXEC: libc::c_uint = 0x4;
 
 // ---------------------------------------------------------------------------
 // OwnedFd — thin RAII wrapper around a raw file descriptor
@@ -205,43 +206,29 @@ impl Drop for FallbackMasterWriter {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: close leaked fds in the child process
+// Helper: prevent fd leaks without breaking Rust's exec-error pipe
 // ---------------------------------------------------------------------------
 
-/// Close all fds above stderr in the child process.
+/// Mark all fds above stderr as close-on-exec in the child process.
 ///
-/// This runs inside `pre_exec` (between `fork()` and `exec()`), so it MUST
-/// only use async-signal-safe operations — no heap allocation, no Rust
-/// stdlib I/O, no iterators that allocate.
-unsafe fn close_fds_above_stderr() {
-    const FALLBACK_MAX_FD: libc::c_int = 1_048_576;
-
-    // Try close_range(3, UINT_MAX, 0) first (Linux 5.9+).
+/// This preserves Rust's internal exec-error reporting pipe until `execve`,
+/// avoiding the stdlib abort seen when the pipe is closed too early, while
+/// still preventing descriptor leaks into the spawned program.
+///
+/// No fallback when `close_range` fails: `CLOSE_RANGE_CLOEXEC` requires
+/// Linux 5.11+, which is satisfied by all Android kernels AXS targets and
+/// by Alpine under proot.  Adding a `/proc/self/fd` enumeration + per-fd
+/// `fcntl(FD_CLOEXEC)` loop would be ~80 lines of async-signal-unsafe code
+/// for an environment that will never exercise it.
+unsafe fn cloexec_fds_above_stderr() {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        let res = libc::syscall(libc::SYS_close_range, 3u64, u32::MAX as u64, 0u64);
-        if res == 0 {
-            return;
-        }
-    }
-
-    // Fallback: close(3..RLIMIT_NOFILE) loop — no allocation needed.
-    let mut rl: libc::rlimit = std::mem::zeroed();
-    let max_fd = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
-        if rl.rlim_cur != libc::RLIM_INFINITY {
-            rl.rlim_cur.min(libc::c_int::MAX as libc::rlim_t) as libc::c_int
-        } else if rl.rlim_max != libc::RLIM_INFINITY {
-            rl.rlim_max.min(libc::c_int::MAX as libc::rlim_t) as libc::c_int
-        } else {
-            FALLBACK_MAX_FD
-        }
-    } else {
-        FALLBACK_MAX_FD
-    };
-    let mut fd: libc::c_int = 3;
-    while fd < max_fd {
-        libc::close(fd);
-        fd += 1;
+        libc::syscall(
+            libc::SYS_close_range,
+            3u64,
+            u32::MAX as u64,
+            CLOSE_RANGE_CLOEXEC as u64,
+        );
     }
 }
 
@@ -357,8 +344,7 @@ pub fn fallback_open_and_spawn(
                     return Err(io::Error::last_os_error());
                 }
 
-                // Close leaked fds
-                close_fds_above_stderr();
+                cloexec_fds_above_stderr();
 
                 Ok(())
             });

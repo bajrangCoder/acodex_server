@@ -40,23 +40,31 @@ impl Scrollback {
         Ok(())
     }
 
-    pub fn read_tail(&self, max_bytes: usize) -> io::Result<Vec<u8>> {
+    pub fn read_tail_and_then<T, F>(&self, max_bytes: usize, then: F) -> io::Result<(Vec<u8>, T)>
+    where
+        F: FnOnce() -> T,
+    {
         self.ensure_file()?;
         let mut guard = self.file.lock().unwrap();
         if let Some(ref mut f) = *guard {
             let file_size = f.seek(SeekFrom::End(0))?;
-            if file_size == 0 {
-                return Ok(Vec::new());
-            }
+            let buf = if file_size == 0 {
+                Vec::new()
+            } else {
+                let read_from = file_size.saturating_sub(max_bytes as u64);
+                f.seek(SeekFrom::Start(read_from))?;
+                let mut buf = Vec::with_capacity((file_size - read_from) as usize);
+                f.read_to_end(&mut buf)?;
+                buf
+            };
 
-            let read_from = file_size.saturating_sub(max_bytes as u64);
-
-            f.seek(SeekFrom::Start(read_from))?;
-            let mut buf = Vec::with_capacity((file_size - read_from) as usize);
-            f.read_to_end(&mut buf)?;
-            Ok(buf)
+            // WebSocket replay must activate live forwarding before releasing the scrollback
+            // lock. Otherwise the PTY reader can append the same early output to scrollback,
+            // replay it, and then forward it live again — duplicating early output.
+            let result = then();
+            Ok((buf, result))
         } else {
-            Ok(Vec::new())
+            Ok((Vec::new(), then()))
         }
     }
 

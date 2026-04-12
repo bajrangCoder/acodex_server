@@ -12,6 +12,8 @@ use axum::{
 
 use axum::http::HeaderValue;
 use dashmap::DashMap;
+use std::env;
+use std::io::Write;
 use std::sync::OnceLock;
 use std::{io::ErrorKind, net::Ipv4Addr, sync::Arc};
 use tower_http::cors::{Any, CorsLayer};
@@ -78,6 +80,27 @@ pub async fn start_server(host: Ipv4Addr, port: u16, allow_any_origin: bool) {
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
             tracing::info!("listening on {}", listener.local_addr().unwrap());
+
+            // Notify parent process via FIFO that the server is ready to accept
+            // connections. The parent shell creates a named pipe and sets
+            // AXS_READY_PIPE; we write "READY\n" and close. The parent's blocking
+            // `read` returns immediately — no HTTP polling needed.
+            //
+            // open() on a FIFO write-end blocks until a reader opens it. This is
+            // acceptable and should never happen in practice:
+            // - Only callers that explicitly set AXS_READY_PIPE opt into this
+            //   path; legacy callers are unaffected.
+            // - A caller that sets the variable is expected to follow the pipe
+            //   protocol (`mkfifo; axs &; read < pipe`), so a reader is always
+            //   present before axs reaches this point.
+            // - A caller that sets the variable yet deliberately violates the
+            //   protocol deserves no fallback — blocking is a visible symptom
+            //   that exposes the misconfiguration rather than hiding it.
+            if let Ok(pipe_path) = env::var("AXS_READY_PIPE") {
+                if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&pipe_path) {
+                    let _ = f.write_all(b"READY\n");
+                }
+            }
 
             if let Err(e) = axum::serve(listener, app).await {
                 tracing::error!("Server error: {}", e);
