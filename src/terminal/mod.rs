@@ -14,6 +14,7 @@ use axum::http::HeaderValue;
 use dashmap::DashMap;
 use std::env;
 use std::io::Write;
+use std::os::unix::fs::FileTypeExt;
 use std::sync::OnceLock;
 use std::{io::ErrorKind, net::Ipv4Addr, sync::Arc};
 use tower_http::cors::{Any, CorsLayer};
@@ -31,6 +32,19 @@ pub fn set_default_command(cmd: String) {
 
 pub fn get_default_command() -> Option<&'static str> {
     DEFAULT_COMMAND.get().map(|s| s.as_str())
+}
+
+fn notify_ready_pipe(pipe_path: &str) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(pipe_path)?;
+    if !metadata.file_type().is_fifo() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "AXS_READY_PIPE must point to a FIFO",
+        ));
+    }
+
+    let mut ready_pipe = std::fs::OpenOptions::new().write(true).open(pipe_path)?;
+    ready_pipe.write_all(b"READY\n")
 }
 
 pub async fn start_server(host: Ipv4Addr, port: u16, allow_any_origin: bool) {
@@ -97,8 +111,17 @@ pub async fn start_server(host: Ipv4Addr, port: u16, allow_any_origin: bool) {
             //   protocol deserves no fallback — blocking is a visible symptom
             //   that exposes the misconfiguration rather than hiding it.
             if let Ok(pipe_path) = env::var("AXS_READY_PIPE") {
-                if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&pipe_path) {
-                    let _ = f.write_all(b"READY\n");
+                // AXS_READY_PIPE is an explicit startup contract with the parent
+                // shell. If open/write fails and the server keeps running, the parent
+                // waits forever for a readiness byte that will never arrive, so fail
+                // fast at the process boundary instead of silently serving traffic.
+                if let Err(error) = notify_ready_pipe(&pipe_path) {
+                    tracing::error!(
+                        "AXS_READY_PIPE notification failed path={} error={}",
+                        pipe_path,
+                        error
+                    );
+                    std::process::exit(1);
                 }
             }
 

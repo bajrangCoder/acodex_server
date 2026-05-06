@@ -20,7 +20,10 @@ use std::time::SystemTime;
 use std::{
     io::Read,
     path::PathBuf,
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc,
+    },
     time::Duration,
 };
 use tokio::sync::Mutex;
@@ -32,6 +35,7 @@ pub struct TerminalSession {
     pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub scrollback: Arc<Scrollback>,
     pub output_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>>,
+    pub live_connection_sequence: Arc<AtomicU64>,
     pub exit_status: Arc<std::sync::Mutex<Option<bool>>>,
     pub exit_notify: Arc<tokio::sync::Notify>,
     pub last_accessed: Arc<Mutex<SystemTime>>,
@@ -146,6 +150,7 @@ pub async fn create_terminal(
     let scrollback = Arc::new(Scrollback::new(pid));
     let output_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>> =
         Arc::new(std::sync::Mutex::new(None));
+    let live_connection_sequence = Arc::new(AtomicU64::new(0));
     let exit_status: Arc<std::sync::Mutex<Option<bool>>> = Arc::new(std::sync::Mutex::new(None));
     let exit_notify = Arc::new(tokio::sync::Notify::new());
 
@@ -202,6 +207,7 @@ pub async fn create_terminal(
         writer,
         scrollback,
         output_tx,
+        live_connection_sequence,
         exit_status,
         exit_notify,
         last_accessed: Arc::new(Mutex::new(SystemTime::now())),
@@ -256,7 +262,7 @@ pub async fn terminal_websocket(
 async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
     let (mut sender, mut receiver) = socket.split();
 
-    let (writer, scrollback, output_tx_arc, exit_status_arc, exit_notify) = {
+    let (writer, scrollback, output_tx_arc, live_connection_sequence, exit_status_arc, exit_notify) = {
         let Some(session) = sessions.get(&pid) else {
             tracing::error!("Session {} not found", pid);
             return;
@@ -269,6 +275,7 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
             session.writer.clone(),
             session.scrollback.clone(),
             session.output_tx.clone(),
+            session.live_connection_sequence.clone(),
             session.exit_status.clone(),
             session.exit_notify.clone(),
         )
@@ -302,18 +309,25 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
 
     // Create output channel for this WS connection
     let (ws_output_tx, mut ws_output_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    let live_connection_id = live_connection_sequence.fetch_add(1, Ordering::AcqRel) + 1;
 
     // Send full scrollback history, then atomically enable live forwarding before the
     // PTY reader can append more bytes to the scrollback file. Without that ordering,
     // the first session can replay the initial MOTD from scrollback and then receive the
     // same bytes again from the live channel during the same handshake window.
+    // Concurrent reconnects can still overlap before the blocking replay starts. The
+    // sequence check prevents an older, slower replay from overwriting the newer socket's
+    // sender, which was the root cause of live output being stolen after reconnect.
     let scrollback_for_replay = scrollback.clone();
     let output_tx_for_replay = output_tx_arc.clone();
     let ws_output_tx_for_replay = ws_output_tx.clone();
+    let live_connection_sequence_for_replay = live_connection_sequence.clone();
     match spawn_blocking(move || {
         scrollback_for_replay.read_tail_and_then(MAX_SCROLLBACK_BYTES, || {
-            let mut guard = output_tx_for_replay.lock().unwrap();
-            *guard = Some(ws_output_tx_for_replay);
+            if live_connection_sequence_for_replay.load(Ordering::Acquire) == live_connection_id {
+                let mut guard = output_tx_for_replay.lock().unwrap();
+                *guard = Some(ws_output_tx_for_replay);
+            }
         })
     })
     .await
@@ -322,17 +336,18 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
             let _ = sender.send(Message::Binary(Bytes::from(contents))).await;
         }
         Ok(Ok((_contents, _))) => {}
-        Ok(Err(e)) => {
-            tracing::warn!("Failed to read scrollback for terminal {}: {}", pid, e);
-            // Scrollback read failed, but we still need to enable live forwarding
-            // so the WebSocket receives PTY output going forward.
-            let mut guard = output_tx_arc.lock().unwrap();
-            *guard = Some(ws_output_tx.clone());
+        Ok(Err(error)) => {
+            tracing::warn!("Failed to read scrollback for terminal {}: {}", pid, error);
+            if live_connection_sequence.load(Ordering::Acquire) == live_connection_id {
+                let mut guard = output_tx_arc.lock().unwrap();
+                *guard = Some(ws_output_tx.clone());
+            }
         }
         _ => {
-            // spawn_blocking itself failed; still enable forwarding.
-            let mut guard = output_tx_arc.lock().unwrap();
-            *guard = Some(ws_output_tx.clone());
+            if live_connection_sequence.load(Ordering::Acquire) == live_connection_id {
+                let mut guard = output_tx_arc.lock().unwrap();
+                *guard = Some(ws_output_tx.clone());
+            }
         }
     }
 
@@ -438,7 +453,16 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
     // Disconnect: clear the output sender so background reader stops forwarding
     {
         let mut guard = output_tx_arc.lock().unwrap();
-        *guard = None;
+        if guard
+            .as_ref()
+            .map(|current_sender| current_sender.same_channel(&ws_output_tx))
+            .unwrap_or(false)
+        {
+            // Only the socket that currently owns live forwarding may clear it.
+            // Older reconnects can disconnect after a newer socket has taken over;
+            // clearing unconditionally would cut off the active client.
+            *guard = None;
+        }
     }
 
     drop(ws_input_tx);

@@ -6,6 +6,7 @@ mod utils;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use lsp::{start_lsp_server, LspBridgeConfig};
+use std::env;
 use std::net::Ipv4Addr;
 use terminal::{set_default_command, start_server};
 use updates::UpdateChecker;
@@ -65,13 +66,16 @@ async fn check_updates_in_background() {
         Ok(Some(version)) => {
             print_update_available(env!("CARGO_PKG_VERSION"), &version);
         }
-        Err(e) => eprintln!(
-            "{} {}",
-            "⚠️".yellow(),
-            format!("Failed to check for updates: {e}").red()
-        ),
+        Err(_) => {}
         _ => {}
     }
+}
+
+fn should_check_updates_on_startup() -> bool {
+    matches!(
+        env::var("AXS_CHECK_UPDATES").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("True")
+    )
 }
 
 #[tokio::main]
@@ -176,7 +180,9 @@ async fn main() {
             start_lsp_server(host, lsp_port, session, allow_any_origin, config).await;
         }
         None => {
-            tokio::task::spawn(check_updates_in_background());
+            if should_check_updates_on_startup() {
+                tokio::task::spawn(check_updates_in_background());
+            }
 
             if let Some(cmd) = command_override {
                 // Set custom default command for interactive terminals

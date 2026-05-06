@@ -215,21 +215,24 @@ impl Drop for FallbackMasterWriter {
 /// avoiding the stdlib abort seen when the pipe is closed too early, while
 /// still preventing descriptor leaks into the spawned program.
 ///
-/// No fallback when `close_range` fails: `CLOSE_RANGE_CLOEXEC` requires
-/// Linux 5.11+, which is satisfied by all Android kernels AXS targets and
-/// by Alpine under proot.  Adding a `/proc/self/fd` enumeration + per-fd
-/// `fcntl(FD_CLOEXEC)` loop would be ~80 lines of async-signal-unsafe code
-/// for an environment that will never exercise it.
-unsafe fn cloexec_fds_above_stderr() {
+/// No enumeration fallback when `close_range` fails: this function runs inside
+/// `pre_exec`, where opening `/proc/self/fd` and walking directory entries would
+/// add async-signal-unsafe work. If the required kernel path is unavailable, fail
+/// the spawn immediately so descriptors cannot silently leak into the child.
+unsafe fn cloexec_fds_above_stderr() -> io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        libc::syscall(
+        let syscall_result = libc::syscall(
             libc::SYS_close_range,
             3u64,
             u32::MAX as u64,
             CLOSE_RANGE_CLOEXEC as u64,
         );
+        if syscall_result == -1 {
+            return Err(io::Error::last_os_error());
+        }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +347,7 @@ pub fn fallback_open_and_spawn(
                     return Err(io::Error::last_os_error());
                 }
 
-                cloexec_fds_above_stderr();
+                cloexec_fds_above_stderr()?;
 
                 Ok(())
             });
