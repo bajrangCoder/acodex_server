@@ -16,6 +16,7 @@ use futures::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use regex::Regex;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use std::{
     io::Read,
@@ -31,10 +32,16 @@ pub struct TerminalSession {
     pub child_killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
     pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub scrollback: Arc<Scrollback>,
-    pub output_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>>,
+    pub output_tx: Arc<std::sync::Mutex<Option<ActiveOutput>>>,
+    pub next_connection_id: Arc<AtomicU64>,
     pub exit_status: Arc<std::sync::Mutex<Option<bool>>>,
     pub exit_notify: Arc<tokio::sync::Notify>,
     pub last_accessed: Arc<Mutex<SystemTime>>,
+}
+
+pub struct ActiveOutput {
+    pub connection_id: u64,
+    pub tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
 pub async fn create_terminal(
@@ -145,7 +152,7 @@ pub async fn create_terminal(
     let child_killer = Arc::new(Mutex::new(child.clone_killer()));
 
     let scrollback = Arc::new(Scrollback::new(pid));
-    let output_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>> =
+    let output_tx: Arc<std::sync::Mutex<Option<ActiveOutput>>> =
         Arc::new(std::sync::Mutex::new(None));
     let exit_status: Arc<std::sync::Mutex<Option<bool>>> = Arc::new(std::sync::Mutex::new(None));
     let exit_notify = Arc::new(tokio::sync::Notify::new());
@@ -167,8 +174,8 @@ pub async fn create_terminal(
                 let _ = scrollback.append(data);
 
                 if let Ok(guard) = output_tx.try_lock() {
-                    if let Some(ref tx) = *guard {
-                        let _ = tx.try_send(data.to_vec());
+                    if let Some(ref output) = *guard {
+                        let _ = output.tx.try_send(data.to_vec());
                     }
                 }
             }
@@ -203,6 +210,7 @@ pub async fn create_terminal(
         writer,
         scrollback,
         output_tx,
+        next_connection_id: Arc::new(AtomicU64::new(1)),
         exit_status,
         exit_notify,
         last_accessed: Arc::new(Mutex::new(SystemTime::now())),
@@ -256,7 +264,7 @@ pub async fn terminal_websocket(
 async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
     let (mut sender, mut receiver) = socket.split();
 
-    let (writer, scrollback, output_tx_arc, exit_status_arc, exit_notify) = {
+    let (writer, scrollback, output_tx_arc, next_connection_id, exit_status_arc, exit_notify) = {
         let Some(session) = sessions.get(&pid) else {
             tracing::error!("Session {} not found", pid);
             return;
@@ -269,6 +277,7 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
             session.writer.clone(),
             session.scrollback.clone(),
             session.output_tx.clone(),
+            session.next_connection_id.clone(),
             session.exit_status.clone(),
             session.exit_notify.clone(),
         )
@@ -302,11 +311,15 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
 
     // Create output channel for this WS connection
     let (ws_output_tx, mut ws_output_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
 
     // Set the sender so background reader starts forwarding to us
     {
         let mut guard = output_tx_arc.lock().unwrap();
-        *guard = Some(ws_output_tx);
+        *guard = Some(ActiveOutput {
+            connection_id,
+            tx: ws_output_tx,
+        });
     }
 
     // Send full scrollback history (client should clear terminal before connecting)
@@ -320,6 +333,11 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
         }
         _ => {}
     }
+    let _ = sender
+        .send(Message::Text(
+            "{\"type\":\"replay_complete\",\"data\":null}".into(),
+        ))
+        .await;
 
     // WS input → PTY writer channel
     let (ws_input_tx, ws_input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
@@ -420,10 +438,18 @@ async fn handle_socket(socket: WebSocket, pid: u32, sessions: Sessions) {
         }
     }
 
-    // Disconnect: clear the output sender so background reader stops forwarding
+    // Disconnect: only the current output owner may clear the forwarding sender.
+    // Older sockets can finish closing after a reconnect has already installed a
+    // newer sender; clearing unconditionally would leave the session connected
+    // for input but silent for output.
     {
         let mut guard = output_tx_arc.lock().unwrap();
-        *guard = None;
+        if guard
+            .as_ref()
+            .is_some_and(|output| output.connection_id == connection_id)
+        {
+            *guard = None;
+        }
     }
 
     drop(ws_input_tx);
