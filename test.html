@@ -1,0 +1,634 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>AcodeX Terminal Test</title>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link
+            href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+            rel="stylesheet"
+        />
+        <link
+            rel="stylesheet"
+            href="https://unpkg.com/xterm@5.3.0/css/xterm.css"
+        />
+        <script src="https://unpkg.com/xterm@5.3.0/lib/xterm.js"></script>
+        <script src="https://unpkg.com/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+        <style>
+            :root {
+                --bg-primary: #0a0e14;
+                --bg-secondary: #111820;
+                --bg-tertiary: #1a2130;
+                --surface: rgba(255, 255, 255, 0.04);
+                --surface-hover: rgba(255, 255, 255, 0.07);
+                --border: rgba(255, 255, 255, 0.08);
+                --border-active: rgba(100, 180, 255, 0.4);
+                --text-primary: #e0e6ed;
+                --text-secondary: #7a8599;
+                --text-muted: #4a5568;
+                --accent: #64b4ff;
+                --accent-glow: rgba(100, 180, 255, 0.15);
+                --green: #4ade80;
+                --green-glow: rgba(74, 222, 128, 0.15);
+                --red: #f87171;
+                --red-glow: rgba(248, 113, 113, 0.15);
+                --yellow: #fbbf24;
+            }
+
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+
+            body {
+                background: var(--bg-primary);
+                color: var(--text-primary);
+                font-family:
+                    "Inter",
+                    -apple-system,
+                    BlinkMacSystemFont,
+                    sans-serif;
+                height: 100vh;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+            }
+
+            .toolbar {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 10px 16px;
+                background: var(--bg-secondary);
+                border-bottom: 1px solid var(--border);
+                flex-shrink: 0;
+            }
+
+            .toolbar .logo {
+                font-size: 14px;
+                font-weight: 600;
+                color: var(--accent);
+                letter-spacing: -0.3px;
+                margin-right: 4px;
+            }
+            .toolbar .logo span {
+                color: var(--text-muted);
+                font-weight: 400;
+            }
+
+            .toolbar .separator {
+                width: 1px;
+                height: 20px;
+                background: var(--border);
+            }
+
+            .toolbar label {
+                font-size: 12px;
+                color: var(--text-secondary);
+                font-weight: 500;
+            }
+
+            .toolbar input {
+                background: var(--bg-primary);
+                border: 1px solid var(--border);
+                color: var(--text-primary);
+                padding: 5px 10px;
+                border-radius: 6px;
+                font-size: 12px;
+                font-family: "JetBrains Mono", monospace;
+                width: 175px;
+                transition: border-color 0.2s;
+            }
+            .toolbar input:focus {
+                outline: none;
+                border-color: var(--border-active);
+                box-shadow: 0 0 0 2px var(--accent-glow);
+            }
+
+            .btn {
+                display: inline-flex;
+                align-items: center;
+                gap: 5px;
+                padding: 5px 12px;
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                background: var(--surface);
+                color: var(--text-secondary);
+                font-size: 12px;
+                font-weight: 500;
+                font-family: "Inter", sans-serif;
+                cursor: pointer;
+                transition: all 0.2s;
+                white-space: nowrap;
+            }
+            .btn:hover {
+                background: var(--surface-hover);
+                color: var(--text-primary);
+            }
+            .btn:active {
+                transform: scale(0.97);
+            }
+
+            .btn.create {
+                border-color: rgba(74, 222, 128, 0.25);
+                color: var(--green);
+            }
+            .btn.create:hover {
+                background: var(--green-glow);
+                border-color: rgba(74, 222, 128, 0.5);
+            }
+
+            .btn.terminate {
+                border-color: rgba(248, 113, 113, 0.2);
+                color: var(--red);
+            }
+            .btn.terminate:hover {
+                background: var(--red-glow);
+                border-color: rgba(248, 113, 113, 0.4);
+            }
+
+            .status-badge {
+                margin-left: auto;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                font-size: 11px;
+                font-weight: 500;
+                padding: 4px 10px;
+                border-radius: 20px;
+                background: var(--surface);
+                border: 1px solid var(--border);
+            }
+            .status-dot {
+                width: 6px;
+                height: 6px;
+                border-radius: 50%;
+                background: var(--text-muted);
+                transition: background 0.3s;
+            }
+            .status-badge.connected .status-dot {
+                background: var(--green);
+                box-shadow: 0 0 6px var(--green);
+            }
+            .status-badge.disconnected .status-dot {
+                background: var(--red);
+            }
+
+            .tabs-bar {
+                display: flex;
+                align-items: flex-end;
+                background: var(--bg-secondary);
+                border-bottom: 1px solid var(--border);
+                flex-shrink: 0;
+                overflow-x: auto;
+                min-height: 34px;
+                padding: 0 8px;
+                gap: 2px;
+            }
+            .tabs-bar::-webkit-scrollbar {
+                height: 0;
+            }
+
+            .tab {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                padding: 7px 14px;
+                font-size: 12px;
+                font-weight: 500;
+                cursor: pointer;
+                color: var(--text-muted);
+                border-radius: 8px 8px 0 0;
+                transition: all 0.15s;
+                white-space: nowrap;
+                user-select: none;
+                border: 1px solid transparent;
+                border-bottom: none;
+            }
+            .tab:hover {
+                color: var(--text-secondary);
+                background: var(--surface);
+            }
+            .tab.active {
+                color: var(--text-primary);
+                background: var(--bg-primary);
+                border-color: var(--border);
+            }
+            .tab .tab-dot {
+                width: 7px;
+                height: 7px;
+                border-radius: 50%;
+                background: var(--green);
+                opacity: 0.7;
+            }
+            .tab .close-btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 16px;
+                height: 16px;
+                border-radius: 4px;
+                font-size: 10px;
+                opacity: 0;
+                transition: all 0.15s;
+            }
+            .tab:hover .close-btn {
+                opacity: 0.5;
+            }
+            .tab .close-btn:hover {
+                opacity: 1;
+                background: var(--red-glow);
+                color: var(--red);
+            }
+
+            #terminal-container {
+                flex: 1;
+                position: relative;
+                background: var(--bg-primary);
+            }
+            .terminal-wrapper {
+                position: absolute;
+                inset: 0;
+                padding: 4px;
+                display: none;
+            }
+            .terminal-wrapper.active {
+                display: block;
+            }
+
+            .empty-state {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                height: 100%;
+                gap: 12px;
+            }
+            .empty-state .icon {
+                font-size: 36px;
+                opacity: 0.3;
+            }
+            .empty-state .hint {
+                color: var(--text-muted);
+                font-size: 13px;
+            }
+            .empty-state kbd {
+                display: inline-block;
+                padding: 2px 6px;
+                border-radius: 4px;
+                background: var(--surface);
+                border: 1px solid var(--border);
+                font-family: "Inter", sans-serif;
+                font-size: 11px;
+                color: var(--text-secondary);
+            }
+        </style>
+    </head>
+    <body>
+        <div class="toolbar">
+            <div class="logo">AcodeX <span>Terminal Test</span></div>
+            <div class="separator"></div>
+            <label>Server</label>
+            <input
+                type="text"
+                id="server-url"
+                value="localhost:8767"
+                spellcheck="false"
+            />
+            <div class="separator"></div>
+            <button class="btn create" onclick="createTerminal()">
+                <span>＋</span> New Session
+            </button>
+            <button class="btn terminate" onclick="terminateActive()">
+                <span>✕</span> Kill
+            </button>
+            <div class="status-badge disconnected" id="status">
+                <div class="status-dot"></div>
+                <span>No sessions</span>
+            </div>
+        </div>
+        <div class="tabs-bar" id="tabs"></div>
+        <div id="terminal-container">
+            <div class="empty-state" id="empty-state">
+                <div class="icon">⬢</div>
+                <div class="hint">
+                    Click <kbd>＋ New Session</kbd> to open a terminal
+                </div>
+            </div>
+        </div>
+
+        <script>
+            const sessions = {};
+            let activeSession = null;
+            let sessionCounter = 0;
+
+            function getBaseUrl() {
+                return `http://${document.getElementById("server-url").value}`;
+            }
+            function getWsUrl() {
+                return `ws://${document.getElementById("server-url").value}`;
+            }
+
+            function setStatus(text, state) {
+                const el = document.getElementById("status");
+                el.className = `status-badge ${state}`;
+                el.querySelector("span").textContent = text;
+            }
+
+            async function createTerminal() {
+                const container = document.getElementById("terminal-container");
+                document.getElementById("empty-state").style.display = "none";
+                sessionCounter++;
+
+                const term = new Terminal({
+                    cursorBlink: true,
+                    cursorStyle: "bar",
+                    fontSize: 14,
+                    fontFamily:
+                        "'JetBrains Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace",
+                    fontWeight: "400",
+                    lineHeight: 1.2,
+                    letterSpacing: 0,
+                    theme: {
+                        background: "#0a0e14",
+                        foreground: "#e0e6ed",
+                        cursor: "#64b4ff",
+                        cursorAccent: "#0a0e14",
+                        selectionBackground: "rgba(100, 180, 255, 0.2)",
+                        selectionForeground: "#ffffff",
+                        black: "#1a2130",
+                        red: "#f87171",
+                        green: "#4ade80",
+                        yellow: "#fbbf24",
+                        blue: "#64b4ff",
+                        magenta: "#c084fc",
+                        cyan: "#22d3ee",
+                        white: "#e0e6ed",
+                        brightBlack: "#4a5568",
+                        brightRed: "#fca5a5",
+                        brightGreen: "#86efac",
+                        brightYellow: "#fde68a",
+                        brightBlue: "#93c5fd",
+                        brightMagenta: "#d8b4fe",
+                        brightCyan: "#67e8f9",
+                        brightWhite: "#f8fafc",
+                    },
+                });
+
+                const fitAddon = new FitAddon.FitAddon();
+                term.loadAddon(fitAddon);
+
+                const wrapper = document.createElement("div");
+                wrapper.className = "terminal-wrapper";
+                container.appendChild(wrapper);
+                term.open(wrapper);
+
+                await new Promise((r) => setTimeout(r, 50));
+                fitAddon.fit();
+
+                try {
+                    const resp = await fetch(`${getBaseUrl()}/terminals`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            cols: term.cols,
+                            rows: term.rows,
+                        }),
+                    });
+
+                    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                    const pid = await resp.text();
+
+                    const session = {
+                        pid,
+                        index: sessionCounter,
+                        term,
+                        fitAddon,
+                        wrapper,
+                        ws: null,
+                        onDataDisposable: null,
+                        connectToken: 0,
+                    };
+                    sessions[pid] = session;
+
+                    addTab(pid, sessionCounter);
+                    switchSession(pid);
+
+                    const resizeObserver = new ResizeObserver(() => {
+                        if (activeSession === pid) {
+                            fitAddon.fit();
+                            resizeRemote(pid, term.cols, term.rows);
+                        }
+                    });
+                    resizeObserver.observe(wrapper);
+                    session.resizeObserver = resizeObserver;
+
+                    term.onResize(({ cols, rows }) =>
+                        resizeRemote(pid, cols, rows),
+                    );
+                } catch (e) {
+                    term.dispose();
+                    wrapper.remove();
+                    setStatus(`Error: ${e.message}`, "disconnected");
+                }
+            }
+
+            function connectWs(pid) {
+                const session = sessions[pid];
+                if (!session) return;
+
+                if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+                    return;
+                }
+
+                const connectToken = ++session.connectToken;
+
+                if (session.ws) {
+                    session.ws.close();
+                    session.ws = null;
+                }
+
+                // Dispose previous input handler to prevent duplicate keystrokes
+                if (session.onDataDisposable) {
+                    session.onDataDisposable.dispose();
+                    session.onDataDisposable = null;
+                }
+
+                // Reset terminal before reconnect — server sends full history replay
+                session.term.reset();
+
+                const ws = new WebSocket(`${getWsUrl()}/terminals/${pid}`);
+                ws.binaryType = "arraybuffer";
+                session.ws = ws;
+
+                const attachInput = () => {
+                    if (
+                        session.connectToken !== connectToken ||
+                        session.ws !== ws ||
+                        ws.readyState !== WebSocket.OPEN ||
+                        session.onDataDisposable
+                    ) {
+                        return;
+                    }
+
+                    session.onDataDisposable = session.term.onData((data) => {
+                        if (
+                            session.ws === ws &&
+                            ws.readyState === WebSocket.OPEN
+                        ) {
+                            ws.send(new TextEncoder().encode(data));
+                        }
+                    });
+                };
+
+                ws.onopen = () => {
+                    if (
+                        session.connectToken !== connectToken ||
+                        session.ws !== ws
+                    )
+                        return;
+                    if (activeSession === pid)
+                        setStatus(`PID ${pid}`, "connected");
+                };
+
+                ws.onmessage = (event) => {
+                    if (
+                        session.connectToken !== connectToken ||
+                        session.ws !== ws
+                    )
+                        return;
+
+                    if (typeof event.data === "string") {
+                        try {
+                            const msg = JSON.parse(event.data);
+                            if (msg.type === "exit") {
+                                session.term.writeln(
+                                    `\r\n\x1b[38;2;120;120;120m── process exited: ${msg.data.message} ──\x1b[0m`,
+                                );
+                                removeSession(pid);
+                                return;
+                            }
+                            if (msg.type === "replay_complete") {
+                                attachInput();
+                                return;
+                            }
+                        } catch {}
+                        session.term.write(event.data);
+                    } else {
+                        session.term.write(new Uint8Array(event.data));
+                    }
+                };
+
+                ws.onclose = () => {
+                    if (session.ws === ws) {
+                        session.ws = null;
+                        if (activeSession === pid)
+                            setStatus(`PID ${pid} offline`, "disconnected");
+                    }
+                };
+
+                ws.onerror = () => {
+                    if (
+                        session.connectToken !== connectToken ||
+                        session.ws !== ws
+                    )
+                        return;
+                    if (activeSession === pid)
+                        setStatus(`PID ${pid} error`, "disconnected");
+                };
+            }
+
+            async function resizeRemote(pid, cols, rows) {
+                try {
+                    await fetch(`${getBaseUrl()}/terminals/${pid}/resize`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ cols, rows }),
+                    });
+                } catch {}
+            }
+
+            function addTab(pid, index) {
+                const tabs = document.getElementById("tabs");
+                const tab = document.createElement("div");
+                tab.className = "tab";
+                tab.id = `tab-${pid}`;
+                tab.innerHTML = `
+                <span class="tab-dot"></span>
+                Session ${index}
+                <span class="close-btn" onclick="event.stopPropagation(); terminateSession('${pid}')">✕</span>
+            `;
+                tab.onclick = () => switchSession(pid);
+                tabs.appendChild(tab);
+            }
+
+            function switchSession(pid) {
+                const prev = activeSession;
+
+                if (prev && sessions[prev]) {
+                    sessions[prev].wrapper.classList.remove("active");
+                    const prevTab = document.getElementById(`tab-${prev}`);
+                    if (prevTab) prevTab.classList.remove("active");
+                }
+
+                activeSession = pid;
+                const session = sessions[pid];
+                if (!session) return;
+
+                session.wrapper.classList.add("active");
+                const tab = document.getElementById(`tab-${pid}`);
+                if (tab) tab.classList.add("active");
+
+                connectWs(pid);
+
+                setTimeout(() => {
+                    session.fitAddon.fit();
+                    session.term.focus();
+                }, 50);
+
+                setStatus(`PID ${pid}`, "connected");
+            }
+
+            async function terminateSession(pid) {
+                try {
+                    await fetch(`${getBaseUrl()}/terminals/${pid}/terminate`, {
+                        method: "POST",
+                    });
+                } catch {}
+                removeSession(pid);
+            }
+
+            function removeSession(pid) {
+                const session = sessions[pid];
+                if (!session) return;
+
+                if (session.ws) session.ws.close();
+                if (session.onDataDisposable)
+                    session.onDataDisposable.dispose();
+                if (session.resizeObserver) session.resizeObserver.disconnect();
+                session.term.dispose();
+                session.wrapper.remove();
+                document.getElementById(`tab-${pid}`)?.remove();
+                delete sessions[pid];
+
+                if (activeSession === pid) {
+                    const remaining = Object.keys(sessions);
+                    if (remaining.length > 0) {
+                        switchSession(remaining[remaining.length - 1]);
+                    } else {
+                        activeSession = null;
+                        setStatus("No sessions", "disconnected");
+                        document.getElementById("empty-state").style.display =
+                            "flex";
+                    }
+                }
+            }
+
+            function terminateActive() {
+                if (activeSession) terminateSession(activeSession);
+            }
+        </script>
+    </body>
+</html>
