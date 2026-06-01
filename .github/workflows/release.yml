@@ -20,21 +20,27 @@ jobs:
           - os_name: Android-aarch64
             target: aarch64-linux-android
             binary_name: axs-android-arm64
+            pie_binary_name: axs-pie-android-arm64
           - os_name: Android-armv7
             target: armv7-linux-androideabi
             binary_name: axs-android-armv7
+            pie_binary_name: axs-pie-android-armv7
           - os_name: Android-x86_64
             target: x86_64-linux-android
             binary_name: axs-android-x86_64
+            pie_binary_name: axs-pie-android-x86_64
           - os_name: MuslAndroid-aarch64
             target: aarch64-unknown-linux-musl
             binary_name: axs-musl-android-arm64
+            pie_binary_name: ""
           - os_name: MuslAndroid-armv7
             target: armv7-unknown-linux-musleabihf
             binary_name: axs-musl-android-armv7
+            pie_binary_name: ""
           - os_name: MuslAndroid-x86_64
             target: x86_64-unknown-linux-musl
             binary_name: axs-musl-android-x86_64
+            pie_binary_name: ""
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -51,10 +57,30 @@ jobs:
       - name: Rename binary
         run: mv target/${{ matrix.platform.target }}/release/axs target/${{ matrix.platform.target }}/release/${{ matrix.platform.binary_name }}
 
+      - name: Build PIE binary with cross
+        if: matrix.platform.pie_binary_name != ''
+        env:
+          RUSTFLAGS: -C relocation-model=pic -C link-arg=-pie
+          CARGO_TARGET_DIR: target/pie
+        run: cross build --release --target ${{ matrix.platform.target }}
+
+      - name: Rename PIE binary
+        if: matrix.platform.pie_binary_name != ''
+        run: mv target/pie/${{ matrix.platform.target }}/release/axs target/${{ matrix.platform.target }}/release/${{ matrix.platform.pie_binary_name }}
+
+      - name: Verify PIE binary
+        if: matrix.platform.pie_binary_name != ''
+        run: |
+          readelf -h target/${{ matrix.platform.target }}/release/${{ matrix.platform.pie_binary_name }}
+          readelf -h target/${{ matrix.platform.target }}/release/${{ matrix.platform.pie_binary_name }} | grep 'Type:.*DYN'
+
       - name: Generate SHA-256
         run: |
           cd target/${{ matrix.platform.target }}/release
           sha256sum ${{ matrix.platform.binary_name }} > ${{ matrix.platform.binary_name }}.sha256
+          if [ -n "${{ matrix.platform.pie_binary_name }}" ]; then
+            sha256sum ${{ matrix.platform.pie_binary_name }} > ${{ matrix.platform.pie_binary_name }}.sha256
+          fi
 
       - name: Upload artifacts
         uses: softprops/action-gh-release@v1
@@ -62,3 +88,11 @@ jobs:
           files: |
             target/${{ matrix.platform.target }}/release/${{ matrix.platform.binary_name }}
             target/${{ matrix.platform.target }}/release/${{ matrix.platform.binary_name }}.sha256
+
+      - name: Upload PIE artifacts
+        if: matrix.platform.pie_binary_name != ''
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            target/${{ matrix.platform.target }}/release/${{ matrix.platform.pie_binary_name }}
+            target/${{ matrix.platform.target }}/release/${{ matrix.platform.pie_binary_name }}.sha256
