@@ -60,7 +60,7 @@ jobs:
       - name: Build PIE binary with cross
         if: matrix.platform.pie_binary_name != ''
         env:
-          RUSTFLAGS: -C relocation-model=pic -C link-arg=-pie
+          RUSTFLAGS: -C relocation-model=pic -C link-arg=-pie -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384
           CARGO_TARGET_DIR: target/pie
         run: cross build --release --target ${{ matrix.platform.target }}
 
@@ -73,6 +73,7 @@ jobs:
         run: |
           readelf -h target/${{ matrix.platform.target }}/release/${{ matrix.platform.pie_binary_name }}
           readelf -h target/${{ matrix.platform.target }}/release/${{ matrix.platform.pie_binary_name }} | grep 'Type:.*DYN'
+          readelf -lW target/${{ matrix.platform.target }}/release/${{ matrix.platform.pie_binary_name }} | awk '/LOAD/ { if ($NF != "0x4000") exit 1; found = 1 } END { exit found ? 0 : 1 }'
 
       - name: Generate SHA-256
         run: |
