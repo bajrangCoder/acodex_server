@@ -60,7 +60,10 @@ jobs:
       - name: Build PIE binary with cross
         if: matrix.platform.pie_binary_name != ''
         env:
-          RUSTFLAGS: -C relocation-model=pic -C link-arg=-pie -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384
+          RUSTFLAGS: >
+            -C relocation-model=pic
+            -C link-arg=-pie
+            -C link-arg=-Wl,-z,max-page-size=16384
           CARGO_TARGET_DIR: target/pie
         run: cross build --release --target ${{ matrix.platform.target }}
 
