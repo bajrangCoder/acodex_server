@@ -64,48 +64,47 @@ pub async fn create_terminal(
         pixel_height: 0,
     };
 
-    // --- Try the standard portable-pty path first ---
-    let pty_system = native_pty_system();
-    let openpty_result = pty_system.openpty(size);
+    // Prefer the Android-safe PTY path. The standard portable-pty path can
+    // succeed at opening a PTY while still failing to make it the child's
+    // controlling terminal on some Android builds, which makes `tty` report
+    // "not a tty" inside interactive shells.
+    let fallback_result = fallback_open_and_spawn(size, &program, &args);
 
-    let std_result = match openpty_result {
-        Ok(pair) => {
-            let mut cmd = CommandBuilder::new(&program);
-            if !args.is_empty() {
-                let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                cmd.args(arg_refs);
-            }
-            match pair.slave.spawn_command(cmd) {
-                Ok(child) => Ok((pair.master, child)),
-                Err(e) => {
-                    // openpty succeeded but spawn failed — this is a command
-                    // error (e.g. missing program), not a PTY capability issue.
-                    // Do NOT fall back; report immediately.
-                    tracing::error!("spawn_command failed: {}", e);
-                    return Json(ErrorResponse {
-                        error: format!("Failed to spawn command: {e}"),
-                    })
-                    .into_response();
-                }
-            }
-        }
-        Err(e) => Err(e),
-    };
-
-    // --- If openpty itself failed, fall back to TIOCGPTPEER ---
-    let (master, mut child) = match std_result {
+    let (master, mut child) = match fallback_result {
         Ok(pair) => pair,
-        Err(e) => {
+        Err(fallback_err) => {
             tracing::warn!(
-                "Standard openpty failed ({}), trying TIOCGPTPEER fallback",
-                e
+                "TIOCGPTPEER PTY path failed ({}), trying standard portable-pty path",
+                fallback_err
             );
-            match fallback_open_and_spawn(size, &program, &args) {
-                Ok(pair) => pair,
-                Err(fb_err) => {
-                    tracing::error!("TIOCGPTPEER fallback also failed: {}", fb_err);
+
+            let pty_system = native_pty_system();
+            match pty_system.openpty(size) {
+                Ok(pair) => {
+                    let mut cmd = CommandBuilder::new(&program);
+                    if !args.is_empty() {
+                        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                        cmd.args(arg_refs);
+                    }
+                    match pair.slave.spawn_command(cmd) {
+                        Ok(child) => (pair.master, child),
+                        Err(e) => {
+                            tracing::error!("spawn_command failed: {}", e);
+                            return Json(ErrorResponse {
+                                error: format!(
+                                    "Failed to spawn command: {e}; TIOCGPTPEER path: {fallback_err}"
+                                ),
+                            })
+                            .into_response();
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("standard portable-pty path also failed: {}", e);
                     return Json(ErrorResponse {
-                        error: format!("Failed to open PTY: {e}; TIOCGPTPEER fallback: {fb_err}"),
+                        error: format!(
+                            "Failed to open PTY: TIOCGPTPEER path: {fallback_err}; standard path: {e}"
+                        ),
                     })
                     .into_response();
                 }
