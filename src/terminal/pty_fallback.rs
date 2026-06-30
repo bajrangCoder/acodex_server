@@ -327,6 +327,7 @@ pub fn fallback_open_and_spawn(
     // 6. Spawn command
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
+    cmd.env("AXS_PTY_BACKEND", "tiocgptpeer");
     unsafe {
         cmd.stdin(child_stdin)
             .stdout(child_stdout)

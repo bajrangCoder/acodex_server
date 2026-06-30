@@ -82,6 +82,7 @@ pub async fn create_terminal(
             match pty_system.openpty(size) {
                 Ok(pair) => {
                     let mut cmd = CommandBuilder::new(&program);
+                    cmd.env("AXS_PTY_BACKEND", "portable-pty");
                     if !args.is_empty() {
                         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                         cmd.args(arg_refs);
